@@ -19,17 +19,14 @@ from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import TelegramError, Forbidden, RetryAfter
 
 # Channel IDs - configured by admin
-ARCHIVE_CHANNEL_1 = -1003386031529  # ערוץ גיבוי תוכן 1
-ARCHIVE_CHANNEL_2 = -1003470142704  # ערוץ גיבוי תוכן 2
 ADMIN_ACTIVITY_CHANNEL = -1003542497376  # ערוץ מידע - בוט אוספים
 
 # Feature toggle
 ENABLE_ARCHIVING = True
 
-# Rate limiting - more conservative to avoid flood control
-ARCHIVE_DELAY = 5.0  # seconds between archive file sends (per channel)
-ACTIVITY_LOG_DELAY = 2.0  # seconds between activity logs
-RETRY_EXTRA_DELAY = 5.0  # extra delay after a retry
+# Rate limiting - minimal delays for activity logging only
+ACTIVITY_LOG_DELAY = 0.3  # seconds between activity logs (reduced from 2.0)
+RETRY_EXTRA_DELAY = 2.0  # extra delay after a retry (reduced from 5.0)
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +301,7 @@ async def log_activity(
                 caption=log_text,
                 reply_markup=reply_markup
             )
+            # Small delay to avoid rate limits
             await asyncio.sleep(ACTIVITY_LOG_DELAY)
         except Exception as e:
             # Never let activity logging crash the main flow
@@ -354,10 +352,6 @@ async def _do_archive_file(
     )
     
     return True
-
-
-    
-    return success_count > 0
 
 
 async def archive_file_to_channels(
@@ -429,8 +423,8 @@ async def _process_archive_queue_safe():
             except Exception as e:
                 logger.error(f"Error processing archive queue item: {e}")
             
-            # Wait before processing next item
-            await asyncio.sleep(ARCHIVE_DELAY)
+            # Minimal delay between queue items
+            await asyncio.sleep(ACTIVITY_LOG_DELAY)
     except Exception as e:
         logger.error(f"Queue processor crashed: {e}")
         async with _archive_lock:
