@@ -201,16 +201,6 @@ async def _send_with_retry(
     return None
 
 
-async def safe_send_to_channel(
-    bot: Bot,
-    channel_id: int,
-    text: str,
-    parse_mode: str = "HTML"
-) -> Optional[int]:
-    """
-    Safely send a text message to a channel with error handling.
-    Returns message_id on success, None on failure.
-    """
 async def safe_copy_file_to_channel(
     bot: Bot,
     channel_id: int,

@@ -2,7 +2,7 @@ import logging
 import math
 import asyncio
 import sys
-from typing import Dict
+
 from telegram import (
     Update,
     InlineKeyboardButton,

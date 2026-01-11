@@ -542,6 +542,4 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error adding item: {e}")
         await message.reply_text("שגיאה בשמירת הפריט.")
 
-async def handle_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This handler monitors deletions
-    pass
+

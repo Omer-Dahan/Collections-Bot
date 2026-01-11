@@ -173,9 +173,7 @@ async def manage_collections_flow(update: Update, context: ContextTypes.DEFAULT_
 @record_activity
 async def manage_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ניהול אוספים - ייצוא ומחיקה"""
-    user = update.effective_user
-    
-    await manage_collections_flow(update.message, user, context)
+    await manage_collections_flow(update, context)
 
 async def show_browse_menu(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, edit_message_id: int = None):
     """
