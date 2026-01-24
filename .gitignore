@@ -16,7 +16,7 @@ venv/
 env/
 
 # Token config, credentials
-config.py
+.env
 
 # Backup files
 *.bak
