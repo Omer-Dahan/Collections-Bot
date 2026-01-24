@@ -143,7 +143,8 @@ async def send_response(
     reply_markup=None,
     edit_message_id: int = None,
     parse_mode=None,
-    allow_delete_on_edit_fail: bool = False
+    allow_delete_on_edit_fail: bool = False,
+    user_id: int = None  # For tracking messages in shared sessions
 ) -> int:
     """
     Unified helper for sending or editing messages.
@@ -156,10 +157,13 @@ async def send_response(
         edit_message_id: If provided, attempt to edit this message first
         parse_mode: Optional parse mode (Markdown, HTML)
         allow_delete_on_edit_fail: If True and edit fails, delete old message before sending new
+        user_id: User ID for tracking messages in shared sessions
         
     Returns:
         message_id of the sent or edited message
     """
+    from message_tracker import track_if_shared
+    
     # If no edit_message_id, send new message directly
     if not edit_message_id:
         msg = await bot.send_message(
@@ -168,6 +172,8 @@ async def send_response(
             reply_markup=reply_markup,
             parse_mode=parse_mode
         )
+        if user_id:
+            track_if_shared(user_id, chat_id, msg.message_id)
         return msg.message_id
     
     # Try to edit existing message
@@ -197,6 +203,8 @@ async def send_response(
             reply_markup=reply_markup,
             parse_mode=parse_mode
         )
+        if user_id:
+            track_if_shared(user_id, chat_id, msg.message_id)
         return msg.message_id
 
 def build_collection_keyboard(collections, callback_prefix: str, add_back_button: bool = False):
@@ -415,7 +423,8 @@ async def send_media_groups_in_chunks(
     media_visual: list,
     media_docs: list,
     text_items: list = None,
-    chunk_size: int = 10
+    chunk_size: int = 10,
+    user_id: int = None  # For tracking messages in shared sessions
 ) -> list[int]:
     """
     Send media groups in chunks to avoid flood limits.
@@ -427,10 +436,13 @@ async def send_media_groups_in_chunks(
         media_docs: List of InputMediaDocument
         text_items: List of text strings to send
         chunk_size: Max items per media group (Telegram limit is 10)
+        user_id: User ID for tracking messages in shared sessions
         
     Returns:
         List of all message_ids sent, in order
     """
+    from message_tracker import track_if_shared
+    
     sent_message_ids = []
     
     # Send text items first
@@ -439,6 +451,8 @@ async def send_media_groups_in_chunks(
             try:
                 msg = await bot.send_message(chat_id=chat_id, text=text)
                 sent_message_ids.append(msg.message_id)
+                if user_id:
+                    track_if_shared(user_id, chat_id, msg.message_id)
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Error sending text item: {e}")
@@ -447,7 +461,10 @@ async def send_media_groups_in_chunks(
     for i in range(0, len(media_visual), chunk_size):
         chunk = media_visual[i:i + chunk_size]
         messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
-        sent_message_ids.extend([m.message_id for m in messages])
+        for m in messages:
+            sent_message_ids.append(m.message_id)
+            if user_id:
+                track_if_shared(user_id, chat_id, m.message_id)
         if i + chunk_size < len(media_visual):
             await asyncio.sleep(4)
     
@@ -455,7 +472,10 @@ async def send_media_groups_in_chunks(
     for i in range(0, len(media_docs), chunk_size):
         chunk = media_docs[i:i + chunk_size]
         messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
-        sent_message_ids.extend([m.message_id for m in messages])
+        for m in messages:
+            sent_message_ids.append(m.message_id)
+            if user_id:
+                track_if_shared(user_id, chat_id, m.message_id)
         if i + chunk_size < len(media_docs):
             await asyncio.sleep(4)
     
@@ -500,6 +520,7 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛠 ניהול אוספים", callback_data="main_menu:manage")],
         [InlineKeyboardButton("🗑 מצב מחיקה", callback_data="main_menu:remove")],
         [InlineKeyboardButton("🔍 זיהוי file_id", callback_data="main_menu:id_file")],
+        [InlineKeyboardButton("🔗 גישה לאוסף משותף", callback_data="main_menu:enter_code")],
     ])
 
 def get_main_menu_text() -> str:
@@ -760,7 +781,8 @@ async def show_collection_page(
     collection_id: int,
     page: int,
     edit_message_id: int = None,
-    force_resend: bool = False
+    force_resend: bool = False,
+    user_id: int = None  # For tracking messages in shared sessions
 ) -> int:
     """
     Central function to display a collection browse page.
@@ -770,15 +792,18 @@ async def show_collection_page(
     Returns:
         message_id of the sent/edited message, or 0 on error
     """
-    user_id = update.effective_user.id
+    from message_tracker import track_if_shared
+    
+    effective_user_id = user_id or update.effective_user.id
     chat_id = update.effective_chat.id
     
     # 1. Check access
-    is_allowed, error_msg, collection = check_collection_access(user_id, collection_id)
+    is_allowed, error_msg, collection = check_collection_access(effective_user_id, collection_id)
     if not is_allowed:
         msg_id = await send_response(
             context.bot, chat_id, error_msg,
-            edit_message_id=edit_message_id if not force_resend else None
+            edit_message_id=edit_message_id if not force_resend else None,
+            user_id=effective_user_id
         )
         return msg_id
 
@@ -794,7 +819,8 @@ async def show_collection_page(
         text = "אין פריטים באוסף הזה."
         msg_id = await send_response(
             context.bot, chat_id, text,
-            edit_message_id=edit_message_id if not force_resend else None
+            edit_message_id=edit_message_id if not force_resend else None,
+            user_id=effective_user_id
         )
         return msg_id
 
@@ -817,7 +843,7 @@ async def show_collection_page(
     ])
     
     # Back button logic
-    if is_admin(user_id) and collection[2] != user_id:
+    if is_admin(effective_user_id) and collection[2] != effective_user_id:
         # Admin viewing someone else's collection -> return to management of that collection
         keyboard_list.append([
             InlineKeyboardButton("⬅️ חזור לניהול האוסף", callback_data=f"admin_manage_col:{collection_id}")
@@ -840,6 +866,9 @@ async def show_collection_page(
                 logger.debug(f"Failed to delete message {edit_message_id}: {e}")
         
         msg = await context.bot.send_message(chat_id=chat_id, text=header_text, reply_markup=reply_markup)
+        # Track for shared sessions
+        if user_id:
+            track_if_shared(user_id, chat_id, msg.message_id)
         return msg.message_id
     else:
         # Use send_response for clean edit/send handling
@@ -847,7 +876,8 @@ async def show_collection_page(
             context.bot, chat_id, header_text,
             reply_markup=reply_markup,
             edit_message_id=edit_message_id,
-            allow_delete_on_edit_fail=True
+            allow_delete_on_edit_fail=True,
+            user_id=effective_user_id
         )
         return msg_id
 

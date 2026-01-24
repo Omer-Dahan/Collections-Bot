@@ -79,6 +79,16 @@ def migrate_db():
         conn.commit()
         print("Migration complete. Added expires_at column.")
     
+    # Add unique index on shared_messages_to_delete for INSERT OR IGNORE support
+    try:
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_messages_unique 
+            ON shared_messages_to_delete(share_code, chat_id, message_id)
+        """)
+        conn.commit()
+    except Exception:
+        pass  # Index may already exist or table doesn't exist yet
+    
     conn.close()
 
 
@@ -160,7 +170,8 @@ def init_db():
         share_code TEXT NOT NULL,
         user_id INTEGER NOT NULL,
         chat_id INTEGER NOT NULL,
-        message_id INTEGER NOT NULL
+        message_id INTEGER NOT NULL,
+        UNIQUE(share_code, chat_id, message_id)
     )
     """)
     
@@ -900,10 +911,11 @@ def get_share_expiration(collection_id: int) -> str | None:
 def log_shared_message(share_code: str, user_id: int, chat_id: int, message_id: int):
     """
     Log a message sent during a shared session for later cleanup.
+    Uses INSERT OR IGNORE to prevent duplicate entries.
     """
     with db_transaction() as (conn, cur):
         cur.execute("""
-            INSERT INTO shared_messages_to_delete (share_code, user_id, chat_id, message_id)
+            INSERT OR IGNORE INTO shared_messages_to_delete (share_code, user_id, chat_id, message_id)
             VALUES (?, ?, ?, ?)
         """, (share_code, user_id, chat_id, message_id))
 

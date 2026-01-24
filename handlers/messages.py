@@ -215,13 +215,7 @@ async def handle_send_collection_confirmation(update: Update, context: ContextTy
         
         chat_id = message.chat_id
         user_id = message.from_user.id
-        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
-        
-        # Track messages for shared collections
-        share_code = active_shared_collections.get(user_id)
-        if share_code and sent_msg_ids:
-            from utils import track_shared_messages
-            track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
+        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items, user_id=user_id)
         
         await message.reply_text("✅ כל הפריטים נשלחו בהצלחה.")
         
@@ -350,10 +344,11 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
         except:
             pass
         
-    await send_response(
+    msg_id = await send_response(
         context.bot, chat_id, 
         f"✅ **גישה אושרה!**\nאתה צופה באוסף המשותף: **{col_name}**{expiry_warning}",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        user_id=user.id
     )
     
     # Immediately show the collection
@@ -361,7 +356,8 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
         update=update,
         context=context,
         collection_id=collection_id,
-        page=1
+        page=1,
+        user_id=user.id  # Pass user_id for message tracking
     )
 
 

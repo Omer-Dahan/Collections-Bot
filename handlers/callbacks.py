@@ -373,17 +373,14 @@ async def handle_browse_group_or_select_all_callback(update: Update, context: Co
         media_visual, media_docs, text_items = prepare_media_groups(items_scope)
         
         chat_id = query.message.chat_id
-        await context.bot.send_message(
+        from message_tracker import track_if_shared
+        msg = await context.bot.send_message(
             chat_id=chat_id, 
             text=f"🚀 שולח {len(items_scope)} פריטים מקבוצה {idx}..."
         )
+        track_if_shared(user_id, chat_id, msg.message_id)
         
-        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
-        
-        # Track messages for shared collections
-        share_code = active_shared_collections.get(user_id)
-        if share_code and sent_msg_ids:
-            track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
+        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items, user_id=user_id)
         
         # After sending, we resend the collection page so it appears at the bottom
         await show_collection_page(
@@ -391,7 +388,8 @@ async def handle_browse_group_or_select_all_callback(update: Update, context: Co
             context=context,
             collection_id=collection_id,
             page=page,
-            force_resend=True
+            force_resend=True,
+            user_id=user_id
         )
         return
 
@@ -484,15 +482,12 @@ async def handle_page_file_send_choice_callback(update: Update, context: Context
     # Send items
     chat_id = query.message.chat_id
     user_id = query.from_user.id
-    await context.bot.send_message(chat_id=chat_id, text=f"🚀 שולח {len(final_items)} פריטים...")
+    from message_tracker import track_if_shared
+    msg = await context.bot.send_message(chat_id=chat_id, text=f"🚀 שולח {len(final_items)} פריטים...")
+    track_if_shared(user_id, chat_id, msg.message_id)
     
     media_visual, media_docs, text_items = prepare_media_groups(final_items)
-    sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
-    
-    # Track messages for shared collections
-    share_code = active_shared_collections.get(user_id)
-    if share_code and sent_msg_ids:
-        track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
+    sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items, user_id=user_id)
     
     if media_visual or media_docs or text_items:
         # Show the collection page again (fresh message at bottom)
@@ -502,13 +497,15 @@ async def handle_page_file_send_choice_callback(update: Update, context: Context
             collection_id=collection_id,
             page=page,
             edit_message_id=query.message.message_id,
-            force_resend=True
+            force_resend=True,
+            user_id=user_id
         )
     else:
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=chat_id,
             text="חלה שגיאה בעיבוד הפריטים.",
         )
+        track_if_shared(user_id, chat_id, msg.message_id)
 
 async def handle_batch_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """הצגת התראה קופצת עם מספר הקבצים שנוספו"""
@@ -677,7 +674,15 @@ async def handle_main_menu_button(update: Update, context: ContextTypes.DEFAULT_
 
     elif action == "enter_code":
         reset_user_modes(context)
-        await access_shared_flow(query.message, query.from_user, context, args=[], edit_message_id=query.message.message_id)
+        context.user_data["waiting_for_share_code"] = True
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ ביטול", callback_data="cancel_share_access")]
+        ])
+        await query.edit_message_text(
+            "🔗 **גישה לאוסף משותף**\n\nאנא שלח את קוד השיתוף שקיבלת:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
     
     elif action == "new_collection":
         await new_collection_flow(query.message, query.from_user, context, [], edit_message_id=query.message.message_id)

@@ -1,6 +1,8 @@
 import logging
+import asyncio
 import db
 from telegram import Update
+from constants import active_shared_collections
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -87,14 +89,16 @@ async def check_expired_shares_job(context):
                     try:
                         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
                         deleted_count += 1
-                        # Small sleep to be nice to API
                         await asyncio.sleep(0.05)
                     except Exception as e:
-                        # Log deletion errors
-                        logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
+                        error_str = str(e).lower()
+                        # Treat as success if message already deleted or not deletable
+                        if "400" in str(e) or "not found" in error_str or "deleted" in error_str:
+                            deleted_count += 1  # Count as success
+                        else:
+                            logger.warning(f"Failed to delete message {message_id}: {e}")
                     finally:
-                        # CRITICAL: Always remove from tracking DB so we don't try again
-                        # even if deletion failed (maybe it's already gone)
+                        # CRITICAL: Always remove from tracking DB
                         db.delete_single_message_record(message_id, chat_id)
                 
                 logger.info(f"Expired share {share_code[:8]}...: deleted {deleted_count}/{len(messages)} messages")
@@ -105,6 +109,35 @@ async def check_expired_shares_job(context):
     except Exception as e:
         logger.error(f"Error in check_expired_shares_job: {e}")
 
+async def track_user_messages(update: Update, context):
+    """
+    Global handler to track ALL user messages during shared sessions.
+    Runs before all other handlers with group=-1.
+    """
+    user = update.effective_user
+    message = update.effective_message
+    if user and message:
+        share_code = active_shared_collections.get(user.id)
+        if share_code:
+            try:
+                db.log_shared_message(share_code, user.id, message.chat_id, message.message_id)
+            except Exception:
+                pass  # Silently ignore tracking errors
+
+
+async def post_init(application):
+    """Set up bot commands menu after bot is initialized."""
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "התחל - תפריט ראשי"),
+        BotCommand("access", "גישה לאוסף משותף"),
+        BotCommand("browse", "דפדוף באוספים"),
+        BotCommand("newcollection", "יצירת אוסף חדש"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Bot commands menu set")
+
+
 def main():
     setup_logging()
     
@@ -114,7 +147,7 @@ def main():
     logger.info("Bot starting...")
 
     request = HTTPXRequest(connection_pool_size=8, read_timeout=60.0, write_timeout=60.0, connect_timeout=60.0, pool_timeout=60.0)
-    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).request(request).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).request(request).post_init(post_init).build()
 
     # --- Error Handler ---
     app.add_error_handler(error_handler)
@@ -184,6 +217,10 @@ def main():
         logger.info("Share expiration cleanup job scheduled")
     else:
         logger.warning("JobQueue not available. Install with: pip install 'python-telegram-bot[job-queue]'")
+
+    # GLOBAL USER MESSAGE TRACKER - runs before all other handlers (group=-1)
+    # Tracks all incoming messages for users in shared sessions
+    app.add_handler(MessageHandler(filters.ALL, track_user_messages), group=-1)
 
     # Everything else (Text, Photo, Video, Document, etc.)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
