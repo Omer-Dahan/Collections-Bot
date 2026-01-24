@@ -7,7 +7,8 @@ from constants import active_collections, active_shared_collections, MSG_NO_COLL
 from utils import (
     track_and_reset_user, verify_user_code, update_batch_status,
     send_response, show_collection_page, format_size, logger,
-    check_collection_access, extract_file_info
+    check_collection_access, extract_file_info,
+    prepare_media_groups, send_media_groups_in_chunks
 )
 from archive_logger import (
     archive_file_to_channels, log_activity, ENABLE_ARCHIVING
@@ -212,7 +213,15 @@ async def handle_send_collection_confirmation(update: Update, context: ContextTy
         
         await status_msg.edit_text(f"📦 שולח {len(items)} פריטים...\n(זה ייקח קצת זמן)")
         
-        await send_media_groups_in_chunks(context.bot, message.chat_id, media_visual, media_docs, text_items)
+        chat_id = message.chat_id
+        user_id = message.from_user.id
+        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
+        
+        # Track messages for shared collections
+        share_code = active_shared_collections.get(user_id)
+        if share_code and sent_msg_ids:
+            from utils import track_shared_messages
+            track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
         
         await message.reply_text("✅ כל הפריטים נשלחו בהצלחה.")
         
@@ -290,9 +299,10 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
     """
     collection = db.get_collection_by_share_code(share_code)
     user = update.effective_user
+    chat_id = update.effective_chat.id
     
     if not collection:
-        await send_response(update, context, "❌ קוד שיתוף לא תקין או פג תוקף.")
+        await send_response(context.bot, chat_id, "❌ קוד שיתוף לא תקין או פג תוקף.")
         # Don't reset mode immediately so they can try again if interactive
         return
 
@@ -302,7 +312,7 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
     
     # Store access
     active_shared_collections[user.id] = share_code
-    db.log_share_access(collection_id, user.id)
+    db.log_share_access(share_code, user.id)
     
     # Log share access event
     if ENABLE_ARCHIVING:
@@ -320,10 +330,29 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
     # Clear waiting mode
     if "waiting_for_share_code" in context.user_data:
         del context.user_data["waiting_for_share_code"]
+    
+    # Check for expiration and build message
+    expiry_warning = ""
+    expires_at = db.get_share_expiration(collection_id)
+    if expires_at:
+        from datetime import datetime
+        try:
+            exp_dt = datetime.fromisoformat(expires_at)
+            now = datetime.now()
+            remaining = exp_dt - now
+            if remaining.total_seconds() > 0:
+                hours = int(remaining.total_seconds() // 3600)
+                minutes = int((remaining.total_seconds() % 3600) // 60)
+                if hours > 0:
+                    expiry_warning = f"\n\n⏳ **שים לב:** אוסף זה יפוג בעוד {hours} שעות ו-{minutes} דקות.\nההודעות שתקבל יימחקו אוטומטית."
+                else:
+                    expiry_warning = f"\n\n⏳ **שים לב:** אוסף זה יפוג בעוד {minutes} דקות.\nההודעות שתקבל יימחקו אוטומטית."
+        except:
+            pass
         
     await send_response(
-        update, context, 
-        f"✅ **גישה אושרה!**\nאתה צופה באוסף המשותף: **{col_name}**",
+        context.bot, chat_id, 
+        f"✅ **גישה אושרה!**\nאתה צופה באוסף המשותף: **{col_name}**{expiry_warning}",
         parse_mode="Markdown"
     )
     
@@ -334,6 +363,8 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
         collection_id=collection_id,
         page=1
     )
+
+
 
 async def handle_id_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message

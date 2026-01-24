@@ -108,8 +108,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["main_menu_msg_id"] = msg.message_id
 
 async def new_collection_flow(message, user, context, args: list[str], edit_message_id: int = None):
-    # Create a temporary Update object for send_response
-    temp_update = type('obj', (object,), {'effective_chat': message.chat, 'effective_user': user})()
+    chat_id = message.chat.id
     
     if not args:
         context.user_data["creating_collection_mode"] = True
@@ -119,7 +118,7 @@ async def new_collection_flow(message, user, context, args: list[str], edit_mess
             [InlineKeyboardButton("📥 יבוא אוסף מקובץ", callback_data="import_collection_mode")],
             [InlineKeyboardButton("🏠 חזור לתפריט ראשי", callback_data="back_to_main")]
         ])
-        await send_response(temp_update, context, text, keyboard, edit_message_id)
+        await send_response(context.bot, chat_id, text, keyboard, edit_message_id)
         return
 
     name = " ".join(args)
@@ -205,9 +204,7 @@ async def show_browse_menu(chat_id: int, user_id: int, context: ContextTypes.DEF
     text = "בחר אוסף לדפדוף:"
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Create temp Update object for send_response
-    temp_update = type('obj', (object,), {'effective_chat': type('obj', (object,), {'id': chat_id})()})()
-    await send_response(temp_update, context, text, reply_markup, edit_message_id)
+    await send_response(context.bot, chat_id, text, reply_markup, edit_message_id)
 
 @record_activity
 async def browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,10 +246,8 @@ async def id_file_flow(message, user, context, edit_message_id: int = None):
         [InlineKeyboardButton("🏠 חזור לתפריט ראשי", callback_data="back_to_main")]
     ])
     
-    # Use temp update object if passing a message object
-    temp_update = type('obj', (object,), {'effective_chat': message.chat})()
     await send_response(
-        temp_update, context, 
+        context.bot, message.chat.id, 
         "🔍 מצב זיהוי הופעל.\nשלח לי כל קובץ, ואחזיר לך את ה-file_id שלו.", 
         keyboard, edit_message_id
     )

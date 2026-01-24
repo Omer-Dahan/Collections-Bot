@@ -31,6 +31,8 @@ from handlers import (
     handle_exit_shared_collection_callback, handle_cancel_share_access_callback,
     handle_exit_delete_mode_callback, handle_import_collection_mode_callback,
     handle_select_item_delete_col_callback,
+    handle_set_share_expiration_callback, handle_save_share_expiration_callback,
+    handle_custom_share_expiration_callback, handle_save_custom_share_expiration_callback,
     handle_message
 )
 
@@ -52,6 +54,56 @@ def setup_logging():
         level=logging.INFO,
         handlers=[file_handler, console_handler]
     )
+
+
+async def check_expired_shares_job(context):
+    """
+    Background job that runs every minute to:
+    1. Find expired shares
+    2. Delete tracked messages from Telegram
+    3. Mark shares as inactive
+    4. Clean up tracking records
+    """
+    try:
+        expired_shares = db.get_expired_shares()
+        
+        if not expired_shares:
+            return
+            
+        logger.info(f"Found {len(expired_shares)} expired shares to process")
+        
+        for share_code, collection_id, owner_id, expires_at in expired_shares:
+            try:
+                # 1. Deactivate immediately to prevent double-processing in next run
+                db.deactivate_share_by_code(share_code)
+                
+                # 2. Get messages
+                messages = db.get_messages_for_share(share_code)
+                deleted_count = 0
+                
+                # 3. Delete messages with rate limiting
+                # 3. Delete messages with rate limiting
+                for user_id, chat_id, message_id in messages:
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                        deleted_count += 1
+                        # Small sleep to be nice to API
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        # Log deletion errors
+                        logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
+                    finally:
+                        # CRITICAL: Always remove from tracking DB so we don't try again
+                        # even if deletion failed (maybe it's already gone)
+                        db.delete_single_message_record(message_id, chat_id)
+                
+                logger.info(f"Expired share {share_code[:8]}...: deleted {deleted_count}/{len(messages)} messages")
+                
+            except Exception as e:
+                logger.error(f"Error processing expired share {share_code}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in check_expired_shares_job: {e}")
 
 def main():
     setup_logging()
@@ -119,6 +171,19 @@ def main():
     
     # External Admin Handlers
     app.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^(admin_|user_stats|system_stats|broadcast|backup_db)"))
+    
+    # Share Expiration
+    app.add_handler(CallbackQueryHandler(handle_set_share_expiration_callback, pattern="^set_share_expiration:"))
+    app.add_handler(CallbackQueryHandler(handle_save_share_expiration_callback, pattern="^save_share_exp:"))
+    app.add_handler(CallbackQueryHandler(handle_custom_share_expiration_callback, pattern="^custom_share_exp:"))
+    app.add_handler(CallbackQueryHandler(handle_save_custom_share_expiration_callback, pattern="^save_share_exp_custom:"))
+    
+    # Background Job for Expired Shares Cleanup
+    if app.job_queue:
+        app.job_queue.run_repeating(check_expired_shares_job, interval=60, first=10)
+        logger.info("Share expiration cleanup job scheduled")
+    else:
+        logger.warning("JobQueue not available. Install with: pip install 'python-telegram-bot[job-queue]'")
 
     # Everything else (Text, Photo, Video, Document, etc.)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))

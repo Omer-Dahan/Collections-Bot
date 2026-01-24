@@ -1,1 +1,1 @@
-python-telegram-bot[rate-limiter]==21.6
+python-telegram-bot[job-queue,rate-limiter]==21.6

@@ -69,6 +69,16 @@ def migrate_db():
         conn.commit()
         print("Migration complete. Added blocked column to users table.")
     
+    # Check if expires_at column exists in shared_collections table
+    cur.execute("PRAGMA table_info(shared_collections)")
+    shared_cols = [info[1] for info in cur.fetchall()]
+    
+    if "expires_at" not in shared_cols:
+        print("Migrating database: Adding expires_at column to shared_collections...")
+        cur.execute("ALTER TABLE shared_collections ADD COLUMN expires_at TEXT")
+        conn.commit()
+        print("Migration complete. Added expires_at column.")
+    
     conn.close()
 
 
@@ -143,12 +153,24 @@ def init_db():
     )
     """)
     
+    # Shared messages tracking - for cleanup when share expires
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS shared_messages_to_delete (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_code TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL
+    )
+    """)
+    
     # Add indices for better performance
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_file_id ON items(file_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_user ON collections(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_shared_collections_code ON shared_collections(share_code)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_archive_info_item ON archive_info(item_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_shared_messages_share_code ON shared_messages_to_delete(share_code)")
     
     conn.commit()
     conn.close()
@@ -828,3 +850,154 @@ def get_archive_info(item_id: int) -> list:
             WHERE item_id = ?
         """, (item_id,))
         return cur.fetchall()
+
+
+# --- Share Expiration Functions ---
+
+def set_share_expiration(collection_id: int, user_id: int, expires_at: str | None) -> bool:
+    """
+    Set or update expiration time for a shared collection.
+    
+    Args:
+        collection_id: The collection ID
+        user_id: The owner user ID (for verification)
+        expires_at: ISO format UTC datetime string, or None for no expiration
+        
+    Returns:
+        True if updated successfully, False otherwise
+    """
+    with db_transaction() as (conn, cur):
+        # Verify ownership
+        cur.execute("SELECT user_id FROM collections WHERE id = ?", (collection_id,))
+        row = cur.fetchone()
+        if not row or row[0] != user_id:
+            return False
+        
+        cur.execute("""
+            UPDATE shared_collections 
+            SET expires_at = ? 
+            WHERE collection_id = ? AND is_active = 1
+        """, (expires_at, collection_id))
+        return cur.rowcount > 0
+
+
+def get_share_expiration(collection_id: int) -> str | None:
+    """
+    Get the expiration time for a shared collection.
+    
+    Returns:
+        ISO format datetime string, or None if no expiration set
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute("""
+            SELECT expires_at FROM shared_collections 
+            WHERE collection_id = ? AND is_active = 1
+        """, (collection_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def log_shared_message(share_code: str, user_id: int, chat_id: int, message_id: int):
+    """
+    Log a message sent during a shared session for later cleanup.
+    """
+    with db_transaction() as (conn, cur):
+        cur.execute("""
+            INSERT INTO shared_messages_to_delete (share_code, user_id, chat_id, message_id)
+            VALUES (?, ?, ?, ?)
+        """, (share_code, user_id, chat_id, message_id))
+
+
+def get_expired_shares() -> list:
+    """
+    Get all active shares that have expired.
+    
+    Returns:
+        List of tuples: (share_code, collection_id, created_by, expires_at)
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        now = datetime.now().isoformat()
+        cur.execute("""
+            SELECT share_code, collection_id, created_by, expires_at
+            FROM shared_collections
+            WHERE is_active = 1 
+            AND expires_at IS NOT NULL 
+            AND expires_at <= ?
+        """, (now,))
+        return cur.fetchall()
+
+
+def get_messages_for_share(share_code: str) -> list:
+    """
+    Get all tracked messages for a share code.
+    
+    Returns:
+        List of tuples: (user_id, chat_id, message_id)
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute("""
+            SELECT DISTINCT user_id, chat_id, message_id
+            FROM shared_messages_to_delete
+            WHERE share_code = ?
+        """, (share_code,))
+        return cur.fetchall()
+
+
+def delete_shared_messages_record(share_code: str) -> int:
+    """
+    Delete all tracked message records for a share code.
+    
+    Returns:
+        Number of records deleted
+    """
+    with db_transaction() as (conn, cur):
+        cur.execute("DELETE FROM shared_messages_to_delete WHERE share_code = ?", (share_code,))
+        return cur.rowcount
+
+
+def delete_single_message_record(message_id: int, chat_id: int) -> int:
+    """
+    Delete a single message record from tracking.
+    """
+    with db_transaction() as (conn, cur):
+        cur.execute("""
+            DELETE FROM shared_messages_to_delete 
+            WHERE message_id = ? AND chat_id = ?
+        """, (message_id, chat_id))
+        return cur.rowcount
+
+
+def deactivate_share_by_code(share_code: str) -> bool:
+    """
+    Deactivate a share directly by share_code.
+    Used by the expiration cleanup job.
+    
+    Returns:
+        True if share was deactivated
+    """
+    try:
+        with db_transaction() as (conn, cur):
+            cur.execute("""
+                UPDATE shared_collections 
+                SET is_active = 0 
+                WHERE share_code = ?
+            """, (share_code,))
+            rows = cur.rowcount
+            conn.commit() # Explicit commit
+            return rows > 0
+    except Exception:
+        return False
+
+
+def count_active_shares_with_expiration() -> int:
+    """
+    Count how many active shares have an expiration date set.
+    For debugging purposes.
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute("""
+            SELECT COUNT(*) 
+            FROM shared_collections 
+            WHERE is_active = 1 AND expires_at IS NOT NULL
+        """)
+        return cur.fetchone()[0]

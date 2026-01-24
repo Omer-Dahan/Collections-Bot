@@ -14,7 +14,7 @@ from telegram import (
     InputMediaDocument,
 )
 from telegram.ext import ContextTypes
-from telegram.error import NetworkError
+from telegram.error import NetworkError, RetryAfter
 import db
 from config import ADMIN_IDS, is_admin
 from constants import MSG_NO_COLLECTIONS, active_collections, active_shared_collections
@@ -136,37 +136,68 @@ def record_activity(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, keyboard=None, edit_message_id: int = None, parse_mode=None):
+async def send_response(
+    bot,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+    edit_message_id: int = None,
+    parse_mode=None,
+    allow_delete_on_edit_fail: bool = False
+) -> int:
     """
-    Helper function to send or edit a message.
-    Reduces code duplication by handling both cases in one place.
-    """
-    if update.effective_chat:
-        chat_id = update.effective_chat.id
-    else:
-        # Fallback if no effective chat (rare)
-        return
-
-    if edit_message_id:
-        try:
-            return await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode=parse_mode
-            )
-        except Exception as e:
-            logger.debug(f"Failed to edit message {edit_message_id}: {e}")
-            # Fall through to send new message
+    Unified helper for sending or editing messages.
     
-    # Send new message
-    return await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=keyboard,
-        parse_mode=parse_mode
-    )
+    Args:
+        bot: The bot instance
+        chat_id: Target chat ID
+        text: Message text
+        reply_markup: Optional keyboard
+        edit_message_id: If provided, attempt to edit this message first
+        parse_mode: Optional parse mode (Markdown, HTML)
+        allow_delete_on_edit_fail: If True and edit fails, delete old message before sending new
+        
+    Returns:
+        message_id of the sent or edited message
+    """
+    # If no edit_message_id, send new message directly
+    if not edit_message_id:
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+        return msg.message_id
+    
+    # Try to edit existing message
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=edit_message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+        return edit_message_id
+    except Exception as e:
+        logger.debug(f"Failed to edit message {edit_message_id}: {e}")
+        
+        # Optionally delete the old message
+        if allow_delete_on_edit_fail:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=edit_message_id)
+            except Exception as del_e:
+                logger.debug(f"Failed to delete message {edit_message_id}: {del_e}")
+        
+        # Send new message
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+        return msg.message_id
 
 def build_collection_keyboard(collections, callback_prefix: str, add_back_button: bool = False):
     """Build a keyboard with collection buttons"""
@@ -178,16 +209,19 @@ def build_collection_keyboard(collections, callback_prefix: str, add_back_button
         keyboard.append([InlineKeyboardButton("🏠 חזור לתפריט ראשי", callback_data="back_to_main")])
     return keyboard
 
-async def show_collections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, callback_prefix: str, text: str, edit_message_id: int = None, extra_buttons: list = None):
+async def show_collections_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, callback_prefix: str, text: str, edit_message_id: int = None, extra_buttons: list = None) -> int:
     """
     Helper to show a list of collections as a menu.
     Reduces code duplication for collection selection flows.
+    
+    Returns:
+        message_id of the sent/edited message
     """
+    chat_id = update.effective_chat.id
     collections = db.get_collections(user_id)
     
     if not collections:
-        await send_response(update, context, MSG_NO_COLLECTIONS, edit_message_id=edit_message_id)
-        return
+        return await send_response(context.bot, chat_id, MSG_NO_COLLECTIONS, edit_message_id=edit_message_id)
     
     keyboard = build_collection_keyboard(collections, callback_prefix, add_back_button=True)
     
@@ -197,7 +231,7 @@ async def show_collections_menu(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard.insert(0, btn_row)
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await send_response(update, context, text, reply_markup, edit_message_id)
+    return await send_response(context.bot, chat_id, text, reply_markup, edit_message_id)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
@@ -258,6 +292,31 @@ def check_collection_access(user_id: int, collection_id: int) -> tuple[bool, str
             return True, "", collection
     
     return False, "אין לך גישה לאוסף הזה.", None
+
+
+def track_shared_messages(
+    share_code: str | None,
+    chat_id: int,
+    user_id: int,
+    message_ids: list[int]
+) -> None:
+    """
+    Track messages sent during a shared session for later cleanup.
+    
+    Args:
+        share_code: The share code (if None, does nothing)
+        chat_id: The chat ID where messages were sent
+        user_id: The user ID who received the messages
+        message_ids: List of message IDs to track
+    """
+    if not share_code or not message_ids:
+        return
+    
+    for msg_id in message_ids:
+        try:
+            db.log_shared_message(share_code, user_id, chat_id, msg_id)
+        except Exception as e:
+            logger.debug(f"Failed to log shared message {msg_id}: {e}")
 
 def create_verification_code(context: ContextTypes.DEFAULT_TYPE, action_type: str, data: dict) -> int:
     """
@@ -321,48 +380,86 @@ def prepare_media_groups(items: list) -> tuple[list, list, list]:
     
     return media_visual, media_docs, text_items
 
-async def safe_send_media_group(bot, chat_id, media, reply_to_message_id=None):
+async def safe_send_media_group(bot, chat_id: int, media: list, retries: int = 3) -> list:
     """
     Safe wrapper for send_media_group that handles RetryAfter errors.
+    
+    Args:
+        bot: The bot instance
+        chat_id: Target chat ID
+        media: List of InputMedia objects
+        retries: Number of retry attempts
+        
+    Returns:
+        List of Message objects sent, or empty list on failure
     """
-    try:
-        await bot.send_media_group(chat_id=chat_id, media=media, reply_to_message_id=reply_to_message_id)
-    except Exception as e:
-        if "RetryAfter" in str(e):
-            # Extract retry time if possible, or default to a safe wait
-            logger.warning(f"Flood control triggered. Waiting... Error: {e}")
-            await asyncio.sleep(5) 
-            try:
-                await bot.send_media_group(chat_id=chat_id, media=media, reply_to_message_id=reply_to_message_id)
-            except Exception as retry_e:
-                logger.error(f"Failed to send media group after retry: {retry_e}")
-        else:
-            logger.error(f"Error sending media group: {e}")
+    for attempt in range(retries):
+        try:
+            result = await bot.send_media_group(chat_id=chat_id, media=media)
+            return list(result) if result else []
+        except RetryAfter as e:
+            wait_time = e.retry_after + 1
+            logger.warning(f"Flood control triggered. Waiting {wait_time}s (attempt {attempt + 1}/{retries})")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            logger.error(f"Error sending media group (attempt {attempt + 1}/{retries}): {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(2)
+    
+    return []
 
-async def send_media_groups_in_chunks(bot, chat_id: int, media_visual: list, media_docs: list, text_items: list = None):
+
+async def send_media_groups_in_chunks(
+    bot,
+    chat_id: int,
+    media_visual: list,
+    media_docs: list,
+    text_items: list = None,
+    chunk_size: int = 10
+) -> list[int]:
     """
-    Send media groups in chunks of 10 to avoid flood limits.
-    Also sends text messages.
+    Send media groups in chunks to avoid flood limits.
+    
+    Args:
+        bot: The bot instance
+        chat_id: Target chat ID
+        media_visual: List of InputMediaPhoto/InputMediaVideo
+        media_docs: List of InputMediaDocument
+        text_items: List of text strings to send
+        chunk_size: Max items per media group (Telegram limit is 10)
+        
+    Returns:
+        List of all message_ids sent, in order
     """
+    sent_message_ids = []
+    
+    # Send text items first
     if text_items:
         for text in text_items:
             try:
-                await bot.send_message(chat_id=chat_id, text=text)
-                await asyncio.sleep(0.5) # Small delay
+                msg = await bot.send_message(chat_id=chat_id, text=text)
+                sent_message_ids.append(msg.message_id)
+                await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Error sending text item: {e}")
-
-    for i in range(0, len(media_visual), 10):
-        chunk = media_visual[i:i + 10]
-        await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
-        if i + 10 < len(media_visual):
+    
+    # Send visual media (photos/videos)
+    for i in range(0, len(media_visual), chunk_size):
+        chunk = media_visual[i:i + chunk_size]
+        messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
+        sent_message_ids.extend([m.message_id for m in messages])
+        if i + chunk_size < len(media_visual):
             await asyncio.sleep(4)
     
-    for i in range(0, len(media_docs), 10):
-        chunk = media_docs[i:i + 10]
-        await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
-        if i + 10 < len(media_docs):
+    # Send documents
+    for i in range(0, len(media_docs), chunk_size):
+        chunk = media_docs[i:i + chunk_size]
+        messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
+        sent_message_ids.extend([m.message_id for m in messages])
+        if i + chunk_size < len(media_docs):
             await asyncio.sleep(4)
+    
+    return sent_message_ids
 
 def get_page_header(collection_id: int, page: int, block_size: int = 100, page_prefix: str = "") -> tuple[str, int, int, int, int, list]:
     """
@@ -413,29 +510,26 @@ def get_main_menu_text() -> str:
         "בחר פעולה מהתפריט למטה:"
     )
 
-async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Send or edit the main menu message.
+    
+    Returns:
+        message_id of the sent/edited message
+    """
     text = get_main_menu_text()
     keyboard = build_main_menu_keyboard()
 
-    msg_id = context.user_data.get("main_menu_msg_id")
-    if msg_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
-                reply_markup=keyboard,
-            )
-            return
-        except Exception:
-           pass
-
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
+    edit_msg_id = context.user_data.get("main_menu_msg_id")
+    
+    msg_id = await send_response(
+        context.bot, chat_id, text,
         reply_markup=keyboard,
+        edit_message_id=edit_msg_id
     )
-    context.user_data["main_menu_msg_id"] = msg.message_id
+    
+    context.user_data["main_menu_msg_id"] = msg_id
+    return msg_id
 
 def format_size(size: int | None) -> str:
     if not size:
@@ -667,11 +761,14 @@ async def show_collection_page(
     page: int,
     edit_message_id: int = None,
     force_resend: bool = False
-):
+) -> int:
     """
     Central function to display a collection browse page.
     Handles permissions, pagination, building the menu with all buttons,
     and sending/editing the message.
+    
+    Returns:
+        message_id of the sent/edited message, or 0 on error
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -679,14 +776,11 @@ async def show_collection_page(
     # 1. Check access
     is_allowed, error_msg, collection = check_collection_access(user_id, collection_id)
     if not is_allowed:
-        if edit_message_id and not force_resend:
-             try:
-                 await context.bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=error_msg)
-             except:
-                 await context.bot.send_message(chat_id=chat_id, text=error_msg)
-        else:
-             await context.bot.send_message(chat_id=chat_id, text=error_msg)
-        return
+        msg_id = await send_response(
+            context.bot, chat_id, error_msg,
+            edit_message_id=edit_message_id if not force_resend else None
+        )
+        return msg_id
 
     # 2. Pagination & Header
     block_size = 100
@@ -698,14 +792,11 @@ async def show_collection_page(
 
     if total_items == 0:
         text = "אין פריטים באוסף הזה."
-        if edit_message_id and not force_resend:
-             try:
-                 await context.bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=text)
-             except:
-                 await context.bot.send_message(chat_id=chat_id, text=text)
-        else:
-             await context.bot.send_message(chat_id=chat_id, text=text)
-        return
+        msg_id = await send_response(
+            context.bot, chat_id, text,
+            edit_message_id=edit_message_id if not force_resend else None
+        )
+        return msg_id
 
     # 3. Build Menu (Numbers buttons)
     reply_markup = build_page_menu(
@@ -741,30 +832,24 @@ async def show_collection_page(
 
     # 5. Send/Edit Logic
     if force_resend:
-        # Calculate fresh header text incase items were deleted/changed outside (though get_page_header does count)
+        # Delete old message if exists, then send new
         if edit_message_id:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=edit_message_id)
-            except:
-                pass
-        await context.bot.send_message(chat_id=chat_id, text=header_text, reply_markup=reply_markup)
+            except Exception as e:
+                logger.debug(f"Failed to delete message {edit_message_id}: {e}")
+        
+        msg = await context.bot.send_message(chat_id=chat_id, text=header_text, reply_markup=reply_markup)
+        return msg.message_id
     else:
-        # Try edit
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=header_text,
-                reply_markup=reply_markup
-            )
-        except Exception:
-            # Edit failed (e.g. content same, or message too old/deleted, or type diff)
-            # Try delete and send new
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=edit_message_id)
-            except:
-                pass
-            await context.bot.send_message(chat_id=chat_id, text=header_text, reply_markup=reply_markup)
+        # Use send_response for clean edit/send handling
+        msg_id = await send_response(
+            context.bot, chat_id, header_text,
+            reply_markup=reply_markup,
+            edit_message_id=edit_message_id,
+            allow_delete_on_edit_fail=True
+        )
+        return msg_id
 
 async def send_info_page(
     bot,
@@ -775,8 +860,13 @@ async def send_info_page(
     page: int,
     info_page: int,
     edit_message_id: int = None
-):
-    """Send or edit info page message showing file details for a collection."""
+) -> int:
+    """
+    Send or edit info page message showing file details for a collection.
+    
+    Returns:
+        message_id of the sent/edited message
+    """
     block_size = 100
     info_group_size = 10
 
@@ -786,12 +876,8 @@ async def send_info_page(
     
     if not items_block:
         text = "אין פריטים בעמוד זה."
-        if edit_message_id:
-            try:
-                return await bot.edit_message_text(chat_id=chat_id, message_id=edit_message_id, text=text)
-            except:
-                pass
-        return await bot.send_message(chat_id=chat_id, text=text)
+        msg_id = await send_response(bot, chat_id, text, edit_message_id=edit_message_id)
+        return msg_id
 
     # Calculate info page bounds
     info_start = info_page * info_group_size
@@ -864,48 +950,14 @@ async def send_info_page(
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Edit or send message
-    if edit_message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=info_text,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
-            )
-            # Save the message ID for later deletion
-            context.user_data["info_message_id"] = edit_message_id
-            return
-        except Exception as e:
-            logger.warning(f"Failed to edit info page: {e}")
-            # Fall through to send new message
+    # Use send_response for edit/send
+    msg_id = await send_response(
+        bot, chat_id, info_text,
+        reply_markup=reply_markup,
+        edit_message_id=edit_message_id,
+        parse_mode="HTML"
+    )
     
-    # Send new message
-    try:
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=info_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
-        )
-        # Save the message ID for later deletion
-        context.user_data["info_message_id"] = msg.message_id
-        return msg
-    except Exception as e:
-        logger.warning(f"Failed to send info page with HTML: {e}")
-        # Fallback: remove HTML tags
-        plain_text = info_text.replace("<b>", "").replace("</b>", "")
-        plain_text = plain_text.replace("<code>", "").replace("</code>", "")
-        plain_text = plain_text.replace("<i>", "").replace("</i>", "")
-        plain_text = plain_text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=plain_text,
-            reply_markup=reply_markup
-        )
-        # Save the message ID for later deletion
-        context.user_data["info_message_id"] = msg.message_id
-        return msg
-
+    # Save the message ID for later deletion
+    context.user_data["info_message_id"] = msg_id
+    return msg_id

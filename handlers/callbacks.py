@@ -1,10 +1,11 @@
 import math
 import asyncio
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 import db
 from config import is_admin
-from constants import active_collections
+from constants import active_collections, active_shared_collections
 from utils import (
     reset_user_modes, send_response, check_collection_access, 
     get_page_header, build_page_menu, show_collection_page,
@@ -12,7 +13,8 @@ from utils import (
     send_media_groups_in_chunks, verify_user_code,
     create_verification_code, update_batch_status, format_size,
     get_main_menu_text, build_main_menu_keyboard,
-    parse_callback_data, validate_access_wrapper, send_info_page
+    parse_callback_data, validate_access_wrapper, send_info_page,
+    track_shared_messages
 )
 from handlers.commands import (
     new_collection_flow, list_collections_flow, manage_collections_flow, 
@@ -370,12 +372,18 @@ async def handle_browse_group_or_select_all_callback(update: Update, context: Co
         # Prepare and send immediately
         media_visual, media_docs, text_items = prepare_media_groups(items_scope)
         
+        chat_id = query.message.chat_id
         await context.bot.send_message(
-            chat_id=query.message.chat_id, 
+            chat_id=chat_id, 
             text=f"🚀 שולח {len(items_scope)} פריטים מקבוצה {idx}..."
         )
         
-        await send_media_groups_in_chunks(context.bot, query.message.chat_id, media_visual, media_docs, text_items)
+        sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
+        
+        # Track messages for shared collections
+        share_code = active_shared_collections.get(user_id)
+        if share_code and sent_msg_ids:
+            track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
         
         # After sending, we resend the collection page so it appears at the bottom
         await show_collection_page(
@@ -475,10 +483,16 @@ async def handle_page_file_send_choice_callback(update: Update, context: Context
 
     # Send items
     chat_id = query.message.chat_id
+    user_id = query.from_user.id
     await context.bot.send_message(chat_id=chat_id, text=f"🚀 שולח {len(final_items)} פריטים...")
     
     media_visual, media_docs, text_items = prepare_media_groups(final_items)
-    await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
+    sent_msg_ids = await send_media_groups_in_chunks(context.bot, chat_id, media_visual, media_docs, text_items)
+    
+    # Track messages for shared collections
+    share_code = active_shared_collections.get(user_id)
+    if share_code and sent_msg_ids:
+        track_shared_messages(share_code, chat_id, user_id, sent_msg_ids)
     
     if media_visual or media_docs or text_items:
         # Show the collection page again (fresh message at bottom)
@@ -770,16 +784,24 @@ async def handle_share_collection_callback(update: Update, context: ContextTypes
     logs = db.get_share_access_logs(collection_id)
     access_count = len(logs)
     
-    args = [str(collection_name), str(share_code), str(access_count)]
+    # Get current expiration
+    expires_at = db.get_share_expiration(collection_id)
+    if expires_at:
+        expiry_text = f"⏱️ תפוגה: {expires_at[:16].replace('T', ' ')}"
+    else:
+        expiry_text = "⏱️ ללא תפוגה"
+    
     text = (
-        "קוד שיתוף לאוסף: {}\n\n"
-        "📋 קוד: `{}`\n\n"
-        "👥 מספר גישות: {}\n\n"
+        f"קוד שיתוף לאוסף: {collection_name}\n\n"
+        f"📋 קוד: `{share_code}`\n\n"
+        f"👥 מספר גישות: {access_count}\n"
+        f"{expiry_text}\n\n"
         "💡 שלח את הקוד הזה למשתמשים אחרים.\n"
         "הם יוכלו לגשת לאוסף באמצעות הפקודה /access."
-    ).format(*args)
+    )
 
     keyboard = [
+        [InlineKeyboardButton("⏱️ הגדרת זמן תפוגה", callback_data=f"set_share_expiration:{collection_id}")],
         [InlineKeyboardButton("📊 סטטיסטיקות גישה", callback_data=f"share_stats:{collection_id}")],
         [InlineKeyboardButton("🔄 חידוש קוד", callback_data=f"regenerate_share:{collection_id}")],
         [InlineKeyboardButton("❌ ביטול שיתוף", callback_data=f"revoke_share:{collection_id}")],
@@ -817,7 +839,9 @@ async def handle_share_stats_callback(update: Update, context: ContextTypes.DEFA
     else:
         text = f"📊 **סטטיסטיקות צפייה ({len(logs)} משתמשים):**\n\n"
         for user_id, username, first_name, accessed_at in logs:
-            name = f"{first_name} " + (f"(@{username})" if username else "")
+            # Escape underscores in username for Markdown
+            safe_username = username.replace("_", "\\_") if username else ""
+            name = f"{first_name} " + (f"(@{safe_username})" if username else "")
             # accessed_at format from SQLite is typically "YYYY-MM-DD HH:MM:SS..."
             # We want "YYYY-MM-DD HH:MM"
             try:
@@ -1007,4 +1031,220 @@ async def handle_exit_delete_mode_callback(update: Update, context: ContextTypes
     await query.edit_message_text(
         "יצאת ממצב מחיקה.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 תפריט ראשי", callback_data="back_to_main")]])
+    )
+
+
+async def handle_set_share_expiration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show expiration time options for a shared collection"""
+    query = update.callback_query
+    await query.answer()
+    
+    parts = parse_callback_data(query.data, "set_share_expiration")
+    if not parts:
+        return
+
+    try:
+        collection_id = int(parts[0])
+    except ValueError:
+        return
+
+    is_allowed, collection = await validate_access_wrapper(update, context, collection_id)
+    if not is_allowed:
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("⌨️ זמן מותאם אישית", callback_data=f"custom_share_exp:{collection_id}")],
+        [InlineKeyboardButton("שעה", callback_data=f"save_share_exp:{collection_id}:1h")],
+        [InlineKeyboardButton("12 שעות", callback_data=f"save_share_exp:{collection_id}:12h")],
+        [InlineKeyboardButton("24 שעות", callback_data=f"save_share_exp:{collection_id}:24h")],
+        [InlineKeyboardButton("47 שעות (מקסימום)", callback_data=f"save_share_exp:{collection_id}:47h")],
+        [InlineKeyboardButton("ללא תפוגה", callback_data=f"save_share_exp:{collection_id}:never")],
+        [InlineKeyboardButton("⬅️ חזור", callback_data=f"share_collection:{collection_id}")]
+    ]
+
+    await query.edit_message_text(
+        "⏱️ בחר זמן תפוגה לשיתוף:\n\n"
+        "כאשר השיתוף יפוג, כל ההודעות שנשלחו\n"
+        "למשתמשים דרך שיתוף זה יימחקו אוטומטית.\n\n"
+        "⚠️ הגבלת טלגרם: ניתן למחוק הודעות\n"
+        "עד 48 שעות אחורה בלבד.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_save_share_expiration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the expiration time for a shared collection"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    parts = parse_callback_data(query.data, "save_share_exp")
+    if not parts or len(parts) < 2:
+        return
+
+    try:
+        collection_id = int(parts[0])
+        duration = parts[1]
+    except (ValueError, IndexError):
+        return
+
+    is_allowed, collection = await validate_access_wrapper(update, context, collection_id)
+    if not is_allowed:
+        return
+
+    # Calculate expiration time (all within 48 hour limit)
+    if duration == "never":
+        expires_at = None
+        expiry_text = "ללא תפוגה (הודעות לא יימחקו)"
+    elif duration == "10m":
+        expires_at = (datetime.now() + timedelta(minutes=10)).isoformat()
+        expiry_text = "10 דקות"
+    elif duration == "1h":
+        expires_at = (datetime.now() + timedelta(hours=1)).isoformat()
+        expiry_text = "שעה"
+    elif duration == "12h":
+        expires_at = (datetime.now() + timedelta(hours=12)).isoformat()
+        expiry_text = "12 שעות"
+    elif duration == "24h":
+        expires_at = (datetime.now() + timedelta(hours=24)).isoformat()
+        expiry_text = "24 שעות"
+    elif duration == "47h":
+        expires_at = (datetime.now() + timedelta(hours=47)).isoformat()
+        expiry_text = "47 שעות"
+    else:
+        return
+
+    # Save to database
+    success = db.set_share_expiration(collection_id, user.id, expires_at)
+    
+    if success:
+        text = f"✅ זמן תפוגה עודכן: {expiry_text}"
+    else:
+        text = "❌ לא הצלחנו לעדכן את זמן התפוגה"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ חזור לשיתוף", callback_data=f"share_collection:{collection_id}")]
+        ])
+    )
+
+
+async def handle_custom_share_expiration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt user to enter custom expiration time in minutes"""
+    query = update.callback_query
+    await query.answer()
+    
+    parts = parse_callback_data(query.data, "custom_share_exp")
+    if not parts:
+        return
+
+    try:
+        collection_id = int(parts[0])
+    except ValueError:
+        return
+
+    is_allowed, collection = await validate_access_wrapper(update, context, collection_id)
+    if not is_allowed:
+        return
+
+    # Initial duration: 60 minutes
+    duration = 60
+    
+    # If there's an existing value in callback data, use it (format: custom_share_exp:col_id:duration)
+    if len(parts) > 1:
+        try:
+            duration = int(parts[1])
+        except ValueError:
+            pass
+            
+    # Cap duration between 1 min and 47 hours (2820 min)
+    duration = max(1, min(duration, 2820))
+    
+    # Calculate display
+    hours = duration // 60
+    minutes = duration % 60
+    
+    time_str = f"{hours} שעות" if minutes == 0 else f"{hours} שעות ו-{minutes} דקות"
+    if hours == 0:
+        time_str = f"{minutes} דקות"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("- שעה", callback_data=f"custom_share_exp:{collection_id}:{duration - 60}"),
+            InlineKeyboardButton("- דקה", callback_data=f"custom_share_exp:{collection_id}:{duration - 1}"),
+            InlineKeyboardButton("+ דקה", callback_data=f"custom_share_exp:{collection_id}:{duration + 1}"),
+            InlineKeyboardButton("+ שעה", callback_data=f"custom_share_exp:{collection_id}:{duration + 60}"),
+        ],
+        [
+            InlineKeyboardButton("- 10 דק'", callback_data=f"custom_share_exp:{collection_id}:{duration - 10}"),
+            InlineKeyboardButton("+ 10 דק'", callback_data=f"custom_share_exp:{collection_id}:{duration + 10}"),
+        ],
+        [InlineKeyboardButton("✅ שמירה", callback_data=f"save_share_exp_custom:{collection_id}:{duration}")],
+        [InlineKeyboardButton("⬅️ חזור", callback_data=f"set_share_expiration:{collection_id}")]
+    ]
+
+    # Don't edit if nothing changed (to avoid Telegram errors)
+    try:
+        await query.edit_message_text(
+            f"⏱️ **הגדרת זמן תפוגה מותאם אישית**\n\n"
+            f"זמן נבחר: **{time_str}**\n\n"
+            f"השתמש בכפתורים כדי לשנות:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        # Ignore if content is same
+        pass
+
+
+async def handle_save_custom_share_expiration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the custom expiration time selected via interactive buttons"""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    parts = parse_callback_data(query.data, "save_share_exp_custom")
+    if not parts or len(parts) < 2:
+        return
+
+    try:
+        collection_id = int(parts[0])
+        minutes = int(parts[1])
+    except (ValueError, IndexError):
+        return
+
+    is_allowed, collection = await validate_access_wrapper(update, context, collection_id)
+    if not is_allowed:
+        return
+
+    # Validate range
+    minutes = max(1, min(minutes, 2820))
+    
+    # Calculate expiration
+    expires_at = (datetime.now() + timedelta(minutes=minutes)).isoformat()
+    
+    # Format display
+    hours = minutes // 60
+    mins = minutes % 60
+    if mins > 0:
+        expiry_text = f"{hours} שעות ו-{mins} דקות"
+    elif hours > 0:
+        expiry_text = f"{hours} שעות"
+    else:
+        expiry_text = f"{minutes} דקות"
+
+    # Save to database
+    success = db.set_share_expiration(collection_id, user.id, expires_at)
+    
+    if success:
+        text = f"✅ זמן תפוגה עודכן: {expiry_text}"
+    else:
+        text = "❌ לא הצלחנו לעדכן את זמן התפוגה"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ חזור לשיתוף", callback_data=f"share_collection:{collection_id}")]
+        ])
     )
