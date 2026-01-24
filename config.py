@@ -3,6 +3,13 @@
 import os
 from typing import List, Optional
 
+# Load .env file if it exists (install: pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, rely on system environment variables
+
 # ============================================================
 # Environment Variable Helper
 # ============================================================
