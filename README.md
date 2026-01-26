@@ -124,6 +124,12 @@ Any redistribution or modification must comply with the terms of this license.
 
 ---
 
+## ⚠️ Disclaimer
+This bot is intended for lawful use only.
+Responsibility for downloaded content and compliance with local laws and platform policies lies solely with the user.
+
+---
+
 <div align="center">
 
 **Made with ❤️ by Omer**
