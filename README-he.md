@@ -72,18 +72,26 @@ python bot.py
 
 ## 🧱 מבנה הפרויקט
 
-<div align="center">
 
-| קובץ | תיאור |
-|------|-------------|
-| `bot.py` | 🧠 הקובץ הראשי ולוגיקת הבוט |
-| `admin_panel.py` | 🔧 ממשק ניהול וסטטיסטיקות לאדמינים |
-| `db.py` | 🗄️ ניהול מסד הנתונים (SQLite) |
-| `utils.py` | 🛠️ פונקציות עזר ובניית ממשק משתמש |
-| `config.py` | ⚙️ קובץ הגדרות (לא נכלל בגיט) |
-| `handlers/` | 📂 טיפול בהודעות ו-Callbacks |
+```
+Collections-bot/
+├── 📄 bot.py               # 🧠 הקובץ הראשי
+├── 📄 admin_panel.py       # �️ פאנל ניהול
+├── 📄 db.py                # 🗄️ מסד נתונים
+├── 📄 utils.py             # 🛠️ פונקציות עזר
+├── 📄 config.py            # ⚙️ הגדרות (רגיש)
+├── 📂 handlers/            # 🎮 לוגיקת הבוט
+│   ├── 📄 commands.py      # פקודות מערכת
+│   ├── 📄 callbacks.py     # טיפול בכפתורים
+│   └── � messages.py      # טיפול במדיה והודעות
+├── 📄 constants.py         # 📝 קבועים
+├── 📄 message_tracker.py   # 📨 מעקב הודעות
+├── 📄 requirements.txt     # 📦 תלויות
+├── 📄 run_bot.bat          # 🚀 מריץ לווינדוס
+├── 📄 LICENSE.txt          # 📜 GPL-3.0
+└── 📄 README.md            # כאן אתם נמצאים! 👋
+```
 
-</div>
 
 ---
 
@@ -110,7 +118,9 @@ python bot.py
 ---
 
 ## 📜 רישיון
-פרויקט זה משוחרר תחת **MIT License**.
+פרויקט זה מורשה תחת **GNU General Public License v3.0**.
+
+כל הפצה מחדש או שינוי חייבים לעמוד בתנאי רישיון זה.
 
 ---
 

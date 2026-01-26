@@ -72,18 +72,26 @@ python bot.py
 
 ## 🧱 Project Structure
 
-<div align="center">
 
-| File | Description |
-|------|-------------|
-| `bot.py` | 🧠 Main bot entry point and logic |
-| `admin_panel.py` | 🔧 Administrative interface and stats |
-| `db.py` | 🗄️ Database operations (SQLite) |
-| `utils.py` | 🛠️ Helper functions & UI builders |
-| `config.py` | ⚙️ Configuration (Not in git) |
-| `handlers/` | 📂 Message and callback handlers |
+```
+Collections-bot/
+├── 📄 bot.py               # 🧠 Main bot entry point
+├── 📄 admin_panel.py       # 🛡️ Admin interface & stats
+├── 📄 db.py                # 🗄️ Database operations
+├── 📄 utils.py             # 🛠️ Helper functions
+├── 📄 config.py            # ⚙️ Configuration (Sensitive)
+├── 📂 handlers/            # 🎮 Logic handlers
+│   ├── 📄 commands.py      # /start, /help, etc.
+│   ├── 📄 callbacks.py     # Button interactions
+│   └── 📄 messages.py      # Media & text handling
+├── 📄 constants.py         # 📝 Constant values
+├── 📄 message_tracker.py   # 📨 Message tracking
+├── 📄 requirements.txt     # 📦 Dependencies
+├── 📄 run_bot.bat          # 🚀 Windows runner
+├── 📄 LICENSE.txt          # 📜 GPL-3.0
+└── 📄 README.md            # You are here! 👋
+```
 
-</div>
 
 ---
 
@@ -110,7 +118,9 @@ Tables are automatically created on first run:
 ---
 
 ## 📜 License
-This project is open source and available under the **MIT License**.
+This project is licensed under **GNU General Public License v3.0**.
+
+Any redistribution or modification must comply with the terms of this license.
 
 ---
 
