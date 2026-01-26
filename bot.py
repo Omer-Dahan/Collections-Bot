@@ -144,6 +144,14 @@ def main():
     # Initialize DB
     db.init_db()
     
+    # Restore active sessions from DB (persistence fix)
+    try:
+        loaded_shares = db.get_users_with_active_shares()
+        active_shared_collections.update(loaded_shares)
+        logger.info(f"Restored {len(loaded_shares)} active shared sessions from DB")
+    except Exception as e:
+        logger.error(f"Failed to restore active sessions: {e}")
+    
     logger.info("Bot starting...")
 
     request = HTTPXRequest(connection_pool_size=8, read_timeout=60.0, write_timeout=60.0, connect_timeout=60.0, pool_timeout=60.0)

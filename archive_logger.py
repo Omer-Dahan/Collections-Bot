@@ -30,21 +30,12 @@ RETRY_EXTRA_DELAY = 2.0  # extra delay after a retry (reduced from 5.0)
 
 logger = logging.getLogger(__name__)
 
-class ArchiveQueueItem(TypedDict):
-    item_id: int
-    file_id: Optional[str]
-    content_type: str
-    user_id: int
-    user_name: str
-    username: Optional[str]
-    collection_id: int
-    collection_name: Optional[str]
-    file_name: Optional[str]
-    original_caption: Optional[str]
-    bot: Bot
 
 # Global queue and lock for serializing archive operations
-_archive_queue: deque[ArchiveQueueItem] = deque()
+_archive_queue: deque = deque()
+
+# Global queue and lock for serializing archive operations
+_archive_queue: deque = deque()
 _archive_lock = asyncio.Lock()
 _queue_processor_running = False
 

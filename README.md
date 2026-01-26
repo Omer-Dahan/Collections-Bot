@@ -1,163 +1,121 @@
+<div align="center">
+
 # 📁 Collections Telegram Bot
 
-A powerful Telegram bot that helps you store, organize, browse, share, and manage collections of media and text.
+![Python](https://img.shields.io/badge/python-3.10+-green?style=for-the-badge&logo=python)
+![Telegram](https://img.shields.io/badge/Telegram-Bot-blue?style=for-the-badge&logo=telegram)
+![SQLite](https://img.shields.io/badge/SQLite-Database-blue?style=for-the-badge&logo=sqlite)
 
-## ⭐ Features
+**A powerful Telegram bot that helps you store, organize, browse, share, and manage collections of media and text.**
 
-### 📦 *Collections*
-- Create multiple collections
-- Add photos, videos, documents, audio, and text
-- Automatic saving with captions
-- Real time batch status
+[🇮🇱 עברית](README-he.md) • [🇺🇸 English](README.md)
 
-### 🔗 *Sharing*
-- Secure share codes
-- View shared collections
-- Usage analytics
+</div>
 
 ---
 
-## 🚀 *Installation*
+## ✨ Key Features
 
-### 1️⃣ *Clone the project*
-```
+| Feature | Description |
+|---------|-------------|
+| 📦 **Collections** | Create and manage multiple media collections |
+| ☁️ **Media Storage** | Store photos, videos, documents, audio, and text |
+| 🔗 **Secure Sharing** | Share collections via unique codes with access tracking |
+| 📊 **Batch Status** | Real-time updates during mass uploads |
+| 🛡️ **Admin Panel** | Full user management and analytics dashboard |
+| 📝 **Auto-Captions** | Automatically saves captions with media |
+| 👁️ **Browsing** | Native Telegram UI for browsing stored content |
+| ⚡ **Performance** | Asynchronous design with flood protection |
+
+---
+
+## 🚀 Installation
+
+### 1️⃣ Clone the project
+```bash
 git clone https://github.com/Omer-Dahan/Collections-bot
 cd Collections-bot
 ```
 
-### 2️⃣ *Create virtual environment*
-```
+### 2️⃣ Create virtual environment
+```bash
+# Windows
 python -m venv venv
-```
-
-### 3️⃣ *Activate it*
-Windows:
-```
 venv\Scripts\activate
-```
-Linux or macOS:
-```
+
+# Linux/macOS
+python3 -m venv venv
 source venv/bin/activate
 ```
 
-### 4️⃣ *Install dependencies*
-```
+### 3️⃣ Install dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-### 5️⃣ *Run the bot*
+### 4️⃣ Configuration
+Create a `config.py` file based on the example below:
+```python
+BOT_TOKEN = "your_bot_token_here"
+ADMIN_IDS = [123456789]  # List of admin Telegram IDs
+
+# Optional custom settings
+MAX_CAPTION_LENGTH = 800
 ```
+
+### 5️⃣ Run the bot
+```bash
 python bot.py
 ```
 
 ---
 
-## 🧱 *Project Structure*
-```
-📁 Collections-bot/
-├── 🧠 bot.py
-├── 🛠 admin_panel.py
-├── 📝 db.py
-├── ⚙️ config.py
-├── 📦 requirements.txt
-└── 📘 README.md
-```
+## 🧱 Project Structure
+
+<div align="center">
+
+| File | Description |
+|------|-------------|
+| `bot.py` | 🧠 Main bot entry point and logic |
+| `admin_panel.py` | 🔧 Administrative interface and stats |
+| `db.py` | 🗄️ Database operations (SQLite) |
+| `utils.py` | 🛠️ Helper functions & UI builders |
+| `config.py` | ⚙️ Configuration (Not in git) |
+| `handlers/` | 📂 Message and callback handlers |
+
+</div>
 
 ---
 
-## ⚙️ *Configuration*
+## 🗄️ Database Architecture
 
-The bot uses a simple configuration file named `config.py` containing all runtime settings.  
-This file is not included in the repository for security reasons and must be created manually.
+The bot uses **SQLite** for efficient local storage.
+Tables are automatically created on first run:
 
-### *Example config.py*
-```
-BOT_TOKEN = "your_bot_token_here"
-
-ADMIN_IDS = [123456789, 987654321]
-
-MAX_CAPTION_LENGTH = 800
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-```
-
-### *Configuration controls*
-- Telegram authentication  
-- Admin permissions  
-- Caption limits  
-- Access control logic  
-- DB migrations depending on admin IDs  
+- **Collections**: Stores collection metadata
+- **Items**: Links media files to collections
+- **Users**: User profiles and stats
+- **Shared_Collections**: Active share codes and permissions
+- **Access_Logs**: Tracks who accessed shared content
 
 ---
 
-## 🗄 *Database Architecture*
+## 🛡️ Security & Privacy
 
-The bot uses SQLite and automatically creates all necessary tables at startup.  
-Migrations run on launch for self contained deployment.
-
-### *Main tables*
-- `collections`  
-- `items`  
-- `users`  
-- `shared_collections`
-- `shared_collection_access_log`
-
-Indexes are included for fast browsing and pagination.
+- 🔒 **Private by Default**: Collections are private unless explicitly shared.
+- 🔑 **Unique Codes**: Sharing uses randomly generated unique access codes.
+- 🚫 **Access Control**: Owners can revoke share codes at any time.
+- 📝 **Logging**: Comprehensive logging of user actions and errors.
 
 ---
 
-## 🔄 *Bot Architecture and Flow Coordination*
-
-The bot is asynchronous and uses python telegram bot v21 along with `AIORateLimiter`.
-
-### *Core coordinators*
-- `active_collections`
-- `active_shared_collections`
-- user_data modes: `delete_mode`, `id_mode`, `waiting_for_share_code`, verification codes
-
-Modes ensure flows never mix or conflict.
-
-### *Automatic state resets*
-All states clear when the user triggers a new command via `reset_user_modes()`.
+## 📜 License
+This project is open source and available under the **MIT License**.
 
 ---
 
-## ⏱ *Rate Limiting and Flood Protection*
-- AIORateLimiter  
-- Custom `safe_send_media_group` retry system  
-- Chunking media into groups of 10  
-- Delays between batches  
+<div align="center">
 
----
+**Made with ❤️ by Omer**
 
-## 📥 *Smart Batch Collection Status*
-- Updates only after cooldown  
-- Fresh message every 30 files  
-- Per collection counters  
-- Prevents mixing counts
-
----
-
-## 🛡 *Access Control and Validation*
-- Ownership verification  
-- Admin bypass  
-- Share code access  
-- Verification codes for destructive operations  
-
----
-
-## 📊 *Logging System*
-- Console logs everything  
-- `bot.log` stores only filtered important actions  
-- Custom filter removes internal noise  
-
----
-
-## 🔧 *Admin Panel Integration*
-The admin panel (`admin_panel.py`) provides:
-- User management  
-- Share code management  
-- Platform statistics  
-- User blocking  
-
+</div>

@@ -306,6 +306,7 @@ async def activate_shared_collection(update: Update, context: ContextTypes.DEFAU
     
     # Store access
     active_shared_collections[user.id] = share_code
+    db.set_user_active_share(user.id, share_code)  # Persist for restart recovery
     db.log_share_access(share_code, user.id)
     
     # Log share access event

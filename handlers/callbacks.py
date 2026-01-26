@@ -1007,6 +1007,7 @@ async def handle_exit_shared_collection_callback(update: Update, context: Contex
     user_id = query.from_user.id
     if user_id in active_shared_collections:
         del active_shared_collections[user_id]
+        db.set_user_active_share(user_id, None)  # Clear from DB persistence
         
     await query.edit_message_text(
         "יצאת מהאוסף המשותף.",

@@ -69,6 +69,17 @@ def migrate_db():
         conn.commit()
         print("Migration complete. Added blocked column to users table.")
     
+    
+    # Check if current_share_code column exists in users table (Migration for Session Persistence)
+    cur.execute("PRAGMA table_info(users)")
+    user_columns = [info[1] for info in cur.fetchall()]
+    
+    if "current_share_code" not in user_columns:
+        print("Migrating database: Adding current_share_code to users...")
+        cur.execute("ALTER TABLE users ADD COLUMN current_share_code TEXT")
+        conn.commit()
+        print("Migration complete. Added current_share_code column to users table.")
+
     # Check if expires_at column exists in shared_collections table
     cur.execute("PRAGMA table_info(shared_collections)")
     shared_cols = [info[1] for info in cur.fetchall()]
@@ -299,35 +310,12 @@ def count_items_in_collection(collection_id: int) -> int:
         return count
 
 
-def delete_item_by_id(item_id: int, user_id: int) -> int:
-    with db_transaction() as (conn, cur):
-        # Only delete if item belongs to a collection owned by user
-        cur.execute("""
-            DELETE FROM items 
-            WHERE id = ? 
-            AND collection_id IN (SELECT id FROM collections WHERE user_id = ?)
-        """, (item_id, user_id))
-        return cur.rowcount
+
+# delete_item_by_id removed (dead code)
 
 
-def delete_items_by_file_id(file_id: str, user_id: int, collection_id: int = None) -> int:
-    with db_transaction() as (conn, cur):
-        if collection_id:
-            # Delete from specific collection (owned by user)
-            cur.execute("""
-                DELETE FROM items 
-                WHERE file_id = ? 
-                AND collection_id = ?
-                AND collection_id IN (SELECT id FROM collections WHERE user_id = ?)
-            """, (file_id, collection_id, user_id))
-        else:
-            # Delete from any collection owned by user (legacy behavior)
-            cur.execute("""
-                DELETE FROM items 
-                WHERE file_id = ? 
-                AND collection_id IN (SELECT id FROM collections WHERE user_id = ?)
-            """, (file_id, user_id))
-        return cur.rowcount
+
+# delete_items_by_file_id removed (dead code)
 
 
 def delete_all_items_in_collection(collection_id: int) -> int:
@@ -425,14 +413,8 @@ def get_all_users_with_collections() -> list:
         return [row[0] for row in cur.fetchall()]
 
 
-def transfer_collection_ownership(collection_id: int, new_user_id: int) -> bool:
-    """Transfer a collection to another user."""
-    with db_transaction() as (conn, cur):
-        try:
-            cur.execute("UPDATE collections SET user_id = ? WHERE id = ?", (new_user_id, collection_id))
-            return cur.rowcount > 0
-        except Exception:
-            return False
+
+# transfer_collection_ownership removed (dead code)
 
 
 def clone_collection_for_user(source_collection_id: int, target_user_id: int) -> int:
@@ -581,6 +563,7 @@ def get_user_details(user_id: int) -> dict | None:
             "last_name": user_row[3],
             "first_seen": user_row[4],
             "blocked": user_row[5] if len(user_row) > 5 else 0,
+            "current_share_code": user_row[6] if len(user_row) > 6 else None,
             "collections_count": collections_count,
             "items_count": items_count
         }
@@ -819,6 +802,8 @@ def get_detailed_access_log(share_code: str, offset: int = 0, limit: int = 50) -
         return cur.fetchall()
 
 
+
+# get_share_by_collection helper
 def get_share_by_collection(collection_id: int) -> tuple | None:
     """
     Get active share info for a collection.
@@ -833,34 +818,40 @@ def get_share_by_collection(collection_id: int) -> tuple | None:
         return cur.fetchone()
 
 
-# --- Archive Info Functions ---
+# --- User Session Persistence Functions ---
 
-def save_archive_info(item_id: int, archive_channel_id: int, archive_message_id: int) -> int:
+def set_user_active_share(user_id: int, share_code: str | None) -> bool:
     """
-    Save archive info for an item.
-    Returns the inserted row id.
+    Update the user's currently active share code in the DB.
+    Used to restore session state on bot restart.
     """
     with db_transaction() as (conn, cur):
-        archived_at = datetime.now().isoformat()
-        cur.execute("""
-            INSERT INTO archive_info (item_id, archive_channel_id, archive_message_id, archived_at)
-            VALUES (?, ?, ?, ?)
-        """, (item_id, archive_channel_id, archive_message_id, archived_at))
-        return cur.lastrowid
+        try:
+            cur.execute("UPDATE users SET current_share_code = ? WHERE user_id = ?", (share_code, user_id))
+            return cur.rowcount > 0
+        except Exception:
+            return False
 
 
-def get_archive_info(item_id: int) -> list:
+def get_users_with_active_shares() -> dict:
     """
-    Get archive info for an item.
-    Returns list of (archive_channel_id, archive_message_id, archived_at) tuples.
+    Get all users who have an active share code set.
+    Returns dict: {user_id: share_code}
     """
     with db_transaction(commit=False) as (conn, cur):
-        cur.execute("""
-            SELECT archive_channel_id, archive_message_id, archived_at
-            FROM archive_info
-            WHERE item_id = ?
-        """, (item_id,))
-        return cur.fetchall()
+        # Only select where current_share_code is not null
+        # And ensure the share code is still active in shared_collections? 
+        # For now, just load what's in users table, validation happens on access anyway eventually.
+        cur.execute("SELECT user_id, current_share_code FROM users WHERE current_share_code IS NOT NULL")
+        rows = cur.fetchall()
+        return {row[0]: row[1] for row in rows}
+
+
+
+# --- Archive Info Functions ---
+
+
+# Archive Info Functions (Removed as dead code)
 
 
 # --- Share Expiration Functions ---
