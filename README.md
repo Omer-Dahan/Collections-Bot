@@ -70,6 +70,51 @@ python bot.py
 
 ---
 
+## 🤖 Usage
+
+Using the bot is simple and intuitive. Here is the basic workflow:
+
+1.  **Start**: Send `/start` to open the main menu.
+2.  **Create Collection**: Select "📁 New Collection", name it, and it will become "active".
+3.  **Save Content**: Any message you send to the bot (photo, video, file, text) will be automatically saved to the active collection.
+4.  **Manage**: Use the menus to browse, delete, or share your collections.
+
+### 🎮 Available Commands
+
+| Command | Description |
+|:---|:---|
+| `/start` | 🏠 Return to main menu and show status |
+| `/new_collection` | 🆕 Create a new collection quickly (e.g. `/new_collection MyTops`) |
+| `/list_collections` | 📋 List your collections and select an active one |
+| `/browse` | 📂 Browse files stored in your collections |
+| `/manage_collections` | ⚙️ Advanced management (Delete, Export, Share) |
+| `/remove` | 🗑️ Activate single item deletion mode |
+| `/id_file` | 🆔 Get the File ID of a file (Developer tool) |
+| `/access` | 🔑 Access a shared collection via code (e.g. `/access CODE123`) |
+
+### 🔄 Workflow
+
+```mermaid
+graph TD
+    A[Start /start] --> B{Main Menu}
+    B -->|New Collection| C[Create Collection]
+    B -->|Select Existing| D[Set Active Collection]
+    B -->|Browse| E[View Items]
+    B -->|Manage| F[Options: Export/Delete/Share]
+    
+    C --> G[📥 Collecting Mode]
+    D --> G
+    
+    G -->|User sends file| H[DB Store]
+    H -->|Feedback| G
+    
+    F -->|Share| I[Generate Code]
+    I -->|Send to Friend| J[User B enters Code]
+    J --> E
+```
+
+---
+
 ## 🧱 Project Structure
 
 
@@ -114,6 +159,22 @@ Tables are automatically created on first run:
 - 🔑 **Unique Codes**: Sharing uses randomly generated unique access codes.
 - 🚫 **Access Control**: Owners can revoke share codes at any time.
 - 📝 **Logging**: Comprehensive logging of user actions and errors.
+
+---
+
+## ⚠️ Important Notes
+
+> [!IMPORTANT]
+> **Telegram Limits**: File uploads are subject to Telegram size limits (up to 2GB per file, or 4GB for Premium subscribers).
+
+> [!WARNING]
+> **Data Privacy**: The database (`bot_data.db`) is stored locally. Deleting this file will result in losing all collection data! Regular backups are recommended.
+
+> [!TIP]
+> **Efficiency**: The bot stores only the `File ID` of files, not the files themselves, saving significant server storage and ensuring fast performance.
+
+> [!NOTE]
+> **Deletion**: Deleting a message from the chat does not remove it from the bot's database. Use the bot's deletion tools to permanently remove items.
 
 ---
 
