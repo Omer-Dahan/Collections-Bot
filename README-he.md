@@ -96,20 +96,20 @@ python bot.py
 
 ```mermaid
 graph TD
-    A[Start /start] --> B{Main Menu}
-    B -->|New Collection| C[Create Collection]
-    B -->|Select Existing| D[Set Active Collection]
-    B -->|Browse| E[View Items]
-    B -->|Manage| F[Options: Export/Delete/Share]
+    A[התחלה /start] --> B{תפריט ראשי}
+    B -->|אוסף חדש| C[יצירת אוסף]
+    B -->|בחר קיים| D[הגדר אוסף פעיל]
+    B -->|דפדוף| E[צפייה בפריטים]
+    B -->|ניהול| F[אפשרויות: ייצוא/מחיקה/שיתוף]
     
-    C --> G[📥 Collecting Mode]
+    C --> G[📥 מצב איסוף]
     D --> G
     
-    G -->|User sends file| H[DB Store]
-    H -->|Feedback| G
+    G -->|משתמש שולח קובץ| H[שמירה במסד נתונים]
+    H -->|משוב| G
     
-    F -->|Share| I[Generate Code]
-    I -->|Send to Friend| J[User B enters Code]
+    F -->|שיתוף| I[יצירת קוד]
+    I -->|שליחה לחבר| J[משתמש ב' מזין קוד]
     J --> E
 ```
 
