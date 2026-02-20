@@ -256,13 +256,24 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # All other errors - log with stacktrace
     logger.exception("Exception while handling update %s", update, exc_info=err)
 
-def reset_user_modes(context: ContextTypes.DEFAULT_TYPE):
-    """Reset all user modes when a new command is issued"""
+def reset_user_modes(context: ContextTypes.DEFAULT_TYPE, user_id: int = None):
+    """Reset all user modes when a new command is issued or returning to menu"""
+    # 1. Clear session-based flags in user_data
     for key in ["delete_mode", "id_mode", "waiting_for_share_code", 
                 "verify_delete_collection", "verify_send_collection",
                 "import_mode", "creating_collection_mode", "temp_collection_name", "allowed_item_ids", "info_page_collection_id",
                 "item_delete_mode", "delete_target_collection_id"]:
         context.user_data.pop(key, None)
+
+    # 2. If user_id provided, clear the global active collections/shared sessions
+    if user_id:
+        if user_id in active_collections:
+            del active_collections[user_id]
+        if user_id in active_shared_collections:
+            del active_shared_collections[user_id]
+        
+        # Also clear DB persistence for shared sessions
+        db.set_user_active_share(user_id, None)
 
 def track_and_reset_user(user, context: ContextTypes.DEFAULT_TYPE):
     """Track user in DB and reset all modes"""

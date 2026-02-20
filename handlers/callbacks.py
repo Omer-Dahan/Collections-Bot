@@ -118,14 +118,12 @@ async def handle_collection_send_all_callback(update: Update, context: ContextTy
         ])
     )
 
-async def handle_stop_collect_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def handle_stop_collect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop active collection mode (adding items) for a user."""
     query = update.callback_query
     await query.answer("מצב איסוף נעצר")
 
-    user_id = query.from_user.id
-    if user_id in active_collections:
-        del active_collections[user_id]
+    reset_user_modes(context, query.from_user.id)
 
     try:
         await query.edit_message_text(
@@ -240,8 +238,8 @@ async def handle_back_to_main_callback(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
 
-    # Reset all modes when returning to main menu
-    reset_user_modes(context)
+    # Reset all modes and active collections when returning to main menu
+    reset_user_modes(context, query.from_user.id)
 
     try:
         await query.edit_message_text(
@@ -347,8 +345,8 @@ def _build_share_keyboard(col_id: int) -> list:
         [InlineKeyboardButton("📊 סטטיסטיקות גישה", callback_data=f"share_stats:{col_id}")],
         [InlineKeyboardButton("🔄 החלף קוד שיתוף", callback_data=f"regenerate_share:{col_id}")],
         [InlineKeyboardButton("⏰ הגדר תפוגה", callback_data=f"set_share_expiration:{col_id}")],
-        [InlineKeyboardButton("� ביטול שיתוף", callback_data=f"revoke_share:{col_id}")],
-        [InlineKeyboardButton("� חזור לניהול", callback_data=f"manage_collection:{col_id}")]
+        [InlineKeyboardButton("🚫 ביטול שיתוף", callback_data=f"revoke_share:{col_id}")],
+        [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
     ]
 
 
@@ -528,8 +526,7 @@ async def handle_cancel_share_access_callback(update: Update, context: ContextTy
     query = update.callback_query
     await query.answer()
 
-    if "waiting_for_share_code" in context.user_data:
-        del context.user_data["waiting_for_share_code"]
+    reset_user_modes(context, query.from_user.id)
     await query.edit_message_text(
         "ביטלת את הכניסה לאוסף.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -542,7 +539,7 @@ async def handle_exit_delete_mode_callback(update: Update, context: ContextTypes
     query = update.callback_query
     await query.answer()
 
-    reset_user_modes(context)
+    reset_user_modes(context, query.from_user.id)
     await query.edit_message_text(
         "יצאת ממצב מחיקה.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
