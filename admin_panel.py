@@ -391,7 +391,7 @@ async def show_shares_dashboard(query, context: ContextTypes.DEFAULT_TYPE, page:
         try:
             date_obj = datetime.fromisoformat(created_at)
             date_str = date_obj.strftime("%d/%m/%Y")
-        except:
+        except ValueError:
             date_str = created_at[:10]
         
         creator_display = creator_username if creator_username else f"User_{created_by}"
@@ -462,7 +462,7 @@ async def show_share_card(query, context: ContextTypes.DEFAULT_TYPE, share_id: i
     try:
         date_obj = datetime.fromisoformat(created_at)
         date_str = date_obj.strftime("%d/%m/%Y %H:%M")
-    except:
+    except ValueError:
         date_str = created_at[:16]
     
     creator_display = creator_username if creator_username else f"User_{created_by}"
@@ -570,7 +570,7 @@ async def show_share_access_log(query, context: ContextTypes.DEFAULT_TYPE, share
         try:
             date_obj = datetime.fromisoformat(accessed_at)
             date_str = date_obj.strftime("%d/%m %H:%M")
-        except:
+        except ValueError:
             date_str = accessed_at[:16]
         
         message_text += f"• {user_link} - {date_str}\n"

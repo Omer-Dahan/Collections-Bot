@@ -13,7 +13,7 @@ Uses a queue-based approach to prevent Telegram rate limiting.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Literal, TypedDict
+from typing import Optional, Literal
 from collections import deque
 from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import TelegramError, Forbidden, RetryAfter
@@ -30,9 +30,6 @@ RETRY_EXTRA_DELAY = 2.0  # extra delay after a retry (reduced from 5.0)
 
 logger = logging.getLogger(__name__)
 
-
-# Global queue and lock for serializing archive operations
-_archive_queue: deque = deque()
 
 # Global queue and lock for serializing archive operations
 _archive_queue: deque = deque()
@@ -62,38 +59,7 @@ ACTION_NAMES_HE = {
 }
 
 
-def format_archive_caption(
-    item_id: int,
-    file_id: str,
-    user_id: int,
-    archive_msg_id: Optional[int] = None,
-    original_caption: Optional[str] = None,
-    user_name: str = "Unknown",
-    username: Optional[str] = None
-) -> str:
-    """
-    Format metadata caption for archived files.
-    """
-    # Format: Name @Username, or ID if no username
-    if username:
-        user_display = f"{user_name} @{username}"
-    else:
-        user_display = str(user_id)
-
-    lines = [
-        f"📦 מזהה פריט: {item_id}",
-        f"📁 מזהה קובץ: {file_id[:50]}..." if len(file_id) > 50 else f"📁 מזהה קובץ: {file_id}",
-        f"👤 שולח: {user_display}",
-    ]
-    
-    if archive_msg_id:
-        lines.insert(2, f"💬 הודעת ארכיון: {archive_msg_id}")
-    
-    if original_caption:
-        lines.append("")
-        lines.append(f"📝 מקורי: {original_caption[:200]}")
-    
-    return "\n".join(lines)
+# format_archive_caption removed (dead code)
 
 
 def format_activity_log(
@@ -148,18 +114,7 @@ def format_activity_log(
     return "\n".join(lines)
 
 
-def get_message_link(channel_id: int, message_id: int) -> str:
-    """
-    Generate a direct link to a message in a private channel.
-    Handles the -100 prefix removal.
-    """
-    channel_id_str = str(channel_id)
-    if channel_id_str.startswith("-100"):
-        link_channel_id = channel_id_str[4:]
-    else:
-        link_channel_id = channel_id_str.lstrip("-")
-    
-    return f"https://t.me/c/{link_channel_id}/{message_id}"
+# get_message_link removed (dead code)
 
 
 async def _send_with_retry(

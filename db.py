@@ -241,34 +241,7 @@ def add_item(
         return cur.lastrowid
 
 
-def is_duplicate_file(collection_id: int, file_id: str, file_size: int | None) -> bool:
-    """
-    Check if a file with the same file_id and file_size already exists in the collection.
-    
-    Args:
-        collection_id: Collection ID to check within
-        file_id: Telegram file_id
-        file_size: File size in bytes
-        
-    Returns:
-        True if duplicate found, False otherwise
-    """
-    with db_transaction(commit=False) as (conn, cur):
-        # If file_size is None, only check file_id
-        if file_size is None:
-            cur.execute(
-                """SELECT COUNT(*) FROM items 
-                   WHERE collection_id = ? AND file_id = ? AND file_size IS NULL""",
-                (collection_id, file_id)
-            )
-        else:
-            cur.execute(
-                """SELECT COUNT(*) FROM items 
-                   WHERE collection_id = ? AND file_id = ? AND file_size = ?""",
-                (collection_id, file_id, file_size)
-            )
-        count = cur.fetchone()[0]
-        return count > 0
+# is_duplicate_file removed (dead code)
 
 
 def get_items_by_collection(collection_id: int, offset: int = 0, limit: int = 10) -> list:
@@ -477,6 +450,10 @@ def get_global_stats() -> dict:
 
 def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None):
     """Insert or update user details."""
+    from datetime import datetime
+    import logging
+    logger = logging.getLogger(__name__)
+
     with db_transaction() as (conn, cur):
         # Check if user exists
         cur.execute("SELECT first_seen FROM users WHERE user_id = ?", (user_id,))
@@ -526,7 +503,7 @@ def block_user(user_id: int) -> bool:
         try:
             cur.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
             return cur.rowcount > 0
-        except:
+        except Exception:
             return False
 
 
@@ -554,7 +531,6 @@ def get_user_details(user_id: int) -> dict | None:
         
         # Get first collection date
         cur.execute("SELECT id FROM collections WHERE user_id = ? ORDER BY id ASC LIMIT 1", (user_id,))
-        first_col = cur.fetchone()
         
         return {
             "user_id": user_row[0],
@@ -596,7 +572,7 @@ def generate_share_code() -> str:
             if count == 0:
                 return code
         
-        raise Exception("Failed to generate unique share code after maximum attempts")
+        raise RuntimeError("Failed to generate unique share code after maximum attempts")
 
 
 def create_share_link(collection_id: int, user_id: int) -> str:
@@ -678,18 +654,7 @@ def regenerate_share_code(collection_id: int, user_id: int) -> str:
     return create_share_link(collection_id, user_id)
 
 
-def get_share_code_for_collection(collection_id: int) -> str | None:
-    """
-    Get the active share code for a collection.
-    Returns None if no active share code exists.
-    """
-    with db_transaction(commit=False) as (conn, cur):
-        cur.execute("""
-            SELECT share_code FROM shared_collections 
-            WHERE collection_id = ? AND is_active = 1
-        """, (collection_id,))
-        row = cur.fetchone()
-        return row[0] if row else None
+# get_share_code_for_collection removed (dead code)
 
 
 def log_share_access(share_code: str, user_id: int):
@@ -804,18 +769,7 @@ def get_detailed_access_log(share_code: str, offset: int = 0, limit: int = 50) -
 
 
 # get_share_by_collection helper
-def get_share_by_collection(collection_id: int) -> tuple | None:
-    """
-    Get active share info for a collection.
-    Returns (id, share_code, created_at, created_by) or None
-    """
-    with db_transaction(commit=False) as (conn, cur):
-        cur.execute("""
-            SELECT id, share_code, created_at, created_by
-            FROM shared_collections
-            WHERE collection_id = ? AND is_active = 1
-        """, (collection_id,))
-        return cur.fetchone()
+# get_share_by_collection removed (dead code)
 
 
 # --- User Session Persistence Functions ---
@@ -946,16 +900,7 @@ def get_messages_for_share(share_code: str) -> list:
         return cur.fetchall()
 
 
-def delete_shared_messages_record(share_code: str) -> int:
-    """
-    Delete all tracked message records for a share code.
-    
-    Returns:
-        Number of records deleted
-    """
-    with db_transaction() as (conn, cur):
-        cur.execute("DELETE FROM shared_messages_to_delete WHERE share_code = ?", (share_code,))
-        return cur.rowcount
+# delete_shared_messages_record removed (dead code)
 
 
 def delete_single_message_record(message_id: int, chat_id: int) -> int:
@@ -992,15 +937,4 @@ def deactivate_share_by_code(share_code: str) -> bool:
         return False
 
 
-def count_active_shares_with_expiration() -> int:
-    """
-    Count how many active shares have an expiration date set.
-    For debugging purposes.
-    """
-    with db_transaction(commit=False) as (conn, cur):
-        cur.execute("""
-            SELECT COUNT(*) 
-            FROM shared_collections 
-            WHERE is_active = 1 AND expires_at IS NOT NULL
-        """)
-        return cur.fetchone()[0]
+# count_active_shares_with_expiration removed (dead code)

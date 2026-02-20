@@ -6,7 +6,8 @@ from constants import active_collections
 from utils import (
     record_activity, get_user_keyboard, get_main_menu_text, 
     build_main_menu_keyboard, send_response, show_collections_menu, 
-    show_collection_page, check_collection_access, logger
+    get_stop_collect_keyboard, get_collect_mode_text,
+    logger
 )
 
 @record_activity
@@ -69,7 +70,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 await status_msg.delete()
-            except:
+            except Exception:
                 pass
                 
             return
@@ -126,16 +127,9 @@ async def new_collection_flow(message, user, context, args: list[str], edit_mess
         collection_id = db.create_collection(name, user.id)
         active_collections[user.id] = collection_id
         
-        # Auto-activate collection mode
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text="🛑 הפסק הוספה", callback_data="stop_collect")]]
-        )
-        
         await message.reply_text(
-            f"✅ אוסף חדש נוצר: {name}\n\n"
-            f"🔄 מתחיל מצב איסוף...\n"
-            f"העלה עכשיו קבצים (תמונות, סרטונים, מסמכים) והם יתווספו לאוסף.",
-            reply_markup=keyboard
+            get_collect_mode_text(name),
+            reply_markup=get_stop_collect_keyboard()
         )
     except Exception as e:
         logger.exception("Error creating collection")
@@ -157,8 +151,6 @@ async def list_collections_flow(update: Update, context: ContextTypes.DEFAULT_TY
 
 @record_activity
 async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
     await list_collections_flow(update, context)
 
 async def manage_collections_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message_id: int = None):
@@ -240,7 +232,7 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await remove_flow(update.message, user, context, context.args)
 
-async def id_file_flow(message, user, context, edit_message_id: int = None):
+async def id_file_flow(message, _user, context, edit_message_id: int = None):
     context.user_data["id_mode"] = True
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 חזור לתפריט ראשי", callback_data="back_to_main")]
@@ -258,10 +250,8 @@ async def id_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await id_file_flow(update.message, user, context)
 
-@record_activity
 async def access_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command to access a shared collection via code"""
-    user = update.effective_user
     
     # Check if code provided in args
     if context.args:

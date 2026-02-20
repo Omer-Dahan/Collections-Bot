@@ -1,7 +1,12 @@
+"""
+Utility functions for the Collections Bot.
+Provides UI helpers, access control, media group preparation, and response wrappers.
+"""
 import logging
 import math
 import asyncio
-import sys
+import random
+import functools
 
 from telegram import (
     Update,
@@ -16,8 +21,9 @@ from telegram import (
 from telegram.ext import ContextTypes
 from telegram.error import NetworkError, RetryAfter
 import db
-from config import ADMIN_IDS, is_admin
 from constants import MSG_NO_COLLECTIONS, active_collections, active_shared_collections
+from config import is_admin
+from message_tracker import track_if_shared
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +72,29 @@ async def validate_access_wrapper(update: Update, context: ContextTypes.DEFAULT_
         message_func = update.effective_chat.send_message if update.effective_chat else None
 
     is_allowed, error_msg, collection = check_collection_access(user_id, collection_id)
-    
+
     if not is_allowed and message_func:
         try:
             await message_func(text=error_msg)
-        except Exception:
+        except Exception: # pylint: disable=broad-exception-caught
              # Fallback if edit fails (e.g. message too old)
              if update.effective_chat:
                  await update.effective_chat.send_message(text=error_msg)
-    
+
     return is_allowed, collection
+
+async def parse_and_validate_access(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list, index: int = 0):
+    """
+    Parses collection ID from callback parts and validates access.
+    Returns (is_allowed, col_id, col_obj).
+    """
+    try:
+        col_id = int(parts[index])
+    except (ValueError, IndexError):
+        return False, None, None
+
+    is_allowed, col = await validate_access_wrapper(update, context, col_id)
+    return is_allowed, col_id, col
 
 def extract_file_info(message):
     """
@@ -128,7 +147,6 @@ def extract_file_info(message):
 
 def record_activity(func):
     """Decorator to track user activity and reset modes"""
-    import functools
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
@@ -148,22 +166,7 @@ async def send_response(
 ) -> int:
     """
     Unified helper for sending or editing messages.
-    
-    Args:
-        bot: The bot instance
-        chat_id: Target chat ID
-        text: Message text
-        reply_markup: Optional keyboard
-        edit_message_id: If provided, attempt to edit this message first
-        parse_mode: Optional parse mode (Markdown, HTML)
-        allow_delete_on_edit_fail: If True and edit fails, delete old message before sending new
-        user_id: User ID for tracking messages in shared sessions
-        
-    Returns:
-        message_id of the sent or edited message
     """
-    from message_tracker import track_if_shared
-    
     # If no edit_message_id, send new message directly
     if not edit_message_id:
         msg = await bot.send_message(
@@ -187,14 +190,14 @@ async def send_response(
         )
         return edit_message_id
     except Exception as e:
-        logger.debug(f"Failed to edit message {edit_message_id}: {e}")
+        logger.debug("Failed to edit message %s: %s", edit_message_id, e)
         
         # Optionally delete the old message
         if allow_delete_on_edit_fail:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=edit_message_id)
             except Exception as del_e:
-                logger.debug(f"Failed to delete message {edit_message_id}: {del_e}")
+                logger.debug("Failed to delete message %s: %s", edit_message_id, del_e)
         
         # Send new message
         msg = await bot.send_message(
@@ -242,15 +245,16 @@ async def show_collections_menu(update: Update, context: ContextTypes.DEFAULT_TY
     return await send_response(context.bot, chat_id, text, reply_markup, edit_message_id)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors occurring during updates."""
     err = context.error
 
     # Network errors like httpx.ReadError, timeouts etc - ignore in logs
     if isinstance(err, NetworkError) or "ReadError" in str(err):
-        logger.warning(f"Network issue ignored: {err}")
+        logger.warning("Network issue ignored: %s", err)
         return
 
     # All other errors - log with stacktrace
-    logger.exception("Exception while handling update", exc_info=err)
+    logger.exception("Exception while handling update %s", update, exc_info=err)
 
 def reset_user_modes(context: ContextTypes.DEFAULT_TYPE):
     """Reset all user modes when a new command is issued"""
@@ -302,35 +306,12 @@ def check_collection_access(user_id: int, collection_id: int) -> tuple[bool, str
     return False, "אין לך גישה לאוסף הזה.", None
 
 
-def track_shared_messages(
-    share_code: str | None,
-    chat_id: int,
-    user_id: int,
-    message_ids: list[int]
-) -> None:
-    """
-    Track messages sent during a shared session for later cleanup.
-    
-    Args:
-        share_code: The share code (if None, does nothing)
-        chat_id: The chat ID where messages were sent
-        user_id: The user ID who received the messages
-        message_ids: List of message IDs to track
-    """
-    if not share_code or not message_ids:
-        return
-    
-    for msg_id in message_ids:
-        try:
-            db.log_shared_message(share_code, user_id, chat_id, msg_id)
-        except Exception as e:
-            logger.debug(f"Failed to log shared message {msg_id}: {e}")
+# track_shared_messages removed (dead code)
 
 def create_verification_code(context: ContextTypes.DEFAULT_TYPE, action_type: str, data: dict) -> int:
     """
     Create a 4-digit verification code and store it in user_data.
     """
-    import random
     code = random.randint(1000, 9999)
     
     context.user_data[f"verify_{action_type}"] = {
@@ -356,9 +337,9 @@ def verify_user_code(message, context: ContextTypes.DEFAULT_TYPE, action_type: s
         if user_code == stored["code"]:
             context.user_data.pop(key)
             return True, stored
-        else:
-            context.user_data.pop(key)
-            return False, None
+        
+        context.user_data.pop(key)
+        return False, None
     except ValueError:
         return False, None
 
@@ -370,7 +351,7 @@ def prepare_media_groups(items: list) -> tuple[list, list, list]:
     media_docs = []
     text_items = []
     
-    for item_id, content_type, file_id, text_content, file_name, file_size, added_at in items:
+    for _, content_type, file_id, text_content, file_name, _, _ in items:
         # Handle text items (no file_id)
         if content_type == "text" or (not file_id and text_content):
             text_items.append(text_content)
@@ -407,10 +388,12 @@ async def safe_send_media_group(bot, chat_id: int, media: list, retries: int = 3
             return list(result) if result else []
         except RetryAfter as e:
             wait_time = e.retry_after + 1
-            logger.warning(f"Flood control triggered. Waiting {wait_time}s (attempt {attempt + 1}/{retries})")
+            logger.warning("Flood control triggered. Waiting %ss (attempt %s/%s)",
+                           wait_time, attempt + 1, retries)
             await asyncio.sleep(wait_time)
         except Exception as e:
-            logger.error(f"Error sending media group (attempt {attempt + 1}/{retries}): {e}")
+            logger.error("Error sending media group (attempt %s/%s): %s",
+                         attempt + 1, retries, e)
             if attempt < retries - 1:
                 await asyncio.sleep(2)
     
@@ -455,7 +438,7 @@ async def send_media_groups_in_chunks(
                     track_if_shared(user_id, chat_id, msg.message_id)
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Error sending text item: {e}")
+                logger.error("Error sending text item: %s", e)
     
     # Send visual media (photos/videos)
     for i in range(0, len(media_visual), chunk_size):
@@ -523,6 +506,22 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔗 גישה לאוסף משותף", callback_data="main_menu:enter_code")],
     ])
 
+# --- UI Helper Functions ---
+
+def get_stop_collect_keyboard() -> InlineKeyboardMarkup:
+    """Returns the keyboard with the 'Stop Collecting' button."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text="🛑 הפסק הוספה", callback_data="stop_collect")]]
+    )
+
+def get_collect_mode_text(collection_name: str) -> str:
+    """Returns the Hebrew text for the start of collection mode."""
+    return (
+        f"✅ אוסף חדש נוצר: {collection_name}\n\n"
+        f"🔄 מתחיל מצב איסוף...\n"
+        f"העלה עכשיו קבצים והם יתווספו לאוסף."
+    )
+
 def get_main_menu_text() -> str:
     """Get the main menu welcome text"""
     return (
@@ -531,39 +530,9 @@ def get_main_menu_text() -> str:
         "בחר פעולה מהתפריט למטה:"
     )
 
-async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Send or edit the main menu message.
-    
-    Returns:
-        message_id of the sent/edited message
-    """
-    text = get_main_menu_text()
-    keyboard = build_main_menu_keyboard()
+# send_main_menu removed (dead code)
 
-    edit_msg_id = context.user_data.get("main_menu_msg_id")
-    
-    msg_id = await send_response(
-        context.bot, chat_id, text,
-        reply_markup=keyboard,
-        edit_message_id=edit_msg_id
-    )
-    
-    context.user_data["main_menu_msg_id"] = msg_id
-    return msg_id
-
-def format_size(size: int | None) -> str:
-    if not size:
-        return ""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    s = float(size)
-    idx = 0
-    while s >= 1024 and idx < len(units) - 1:
-        s /= 1024.0
-        idx += 1
-    if idx == 0:
-        return f"{int(s)} {units[idx]}"
-    return f"{s:.1f} {units[idx]}"
+# format_size removed (dead code)
 
 async def batch_status_loop(chat_id: int, collection_id: int, collection_name: str, context: ContextTypes.DEFAULT_TYPE, user_data_status: dict):
     """Background loop to update status message every few seconds"""
@@ -597,7 +566,7 @@ async def batch_status_loop(chat_id: int, collection_id: int, collection_name: s
                     user_data_status["msg_id"] = msg.message_id
                     user_data_status["last_sent_count"] = current_count
                 except Exception as e:
-                    logger.error(f"Error sending batch status: {e}")
+                    logger.error("Error sending batch status: %s", e)
             
             # Wait 2 seconds
             await asyncio.sleep(2)
@@ -608,7 +577,7 @@ async def batch_status_loop(chat_id: int, collection_id: int, collection_name: s
                 break
                 
     except Exception as e:
-        logger.error(f"Error in batch_status_loop: {e}")
+        logger.error("Error in batch_status_loop: %s", e)
         user_data_status["is_updating"] = False
 
 async def update_batch_status(message, context: ContextTypes.DEFAULT_TYPE, collection_name: str):
@@ -652,13 +621,7 @@ async def update_batch_status(message, context: ContextTypes.DEFAULT_TYPE, colle
             )
         )
 
-async def delete_message_after_delay(bot, chat_id: int, message_id: int, delay: int):
-    """Delete a message after delay"""
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+# delete_message_after_delay removed (dead code)
 
 def build_page_menu(
     collection_id: int,
@@ -863,7 +826,7 @@ async def show_collection_page(
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=edit_message_id)
             except Exception as e:
-                logger.debug(f"Failed to delete message {edit_message_id}: {e}")
+                logger.debug("Failed to delete message %s: %s", edit_message_id, e)
         
         msg = await context.bot.send_message(chat_id=chat_id, text=header_text, reply_markup=reply_markup)
         # Track for shared sessions
@@ -941,7 +904,7 @@ async def send_info_page(
     info_text += f"מציג {info_start + 1}-{min(info_end, len(items_block))} מתוך {len(items_block)}\n\n"
     
     for item in items_to_show:
-        item_id, content_type, file_id, text_content, file_name, file_size, added_at = item
+        item_id, content_type, _, text_content, file_name, _, _ = item
         
         type_display = content_type_map.get(content_type, "📁 קובץ")
         name_display = escape_html(file_name) if file_name else "(ללא שם קובץ)"
@@ -952,7 +915,7 @@ async def send_info_page(
         info_text += "─────────────────\n"
     
     # Store allowed IDs for this user (security - only allow IDs shown on current page)
-    context.user_data["allowed_item_ids"] = [item[0] for item in items_to_show]
+    context.user_data["allowed_item_ids"] = [it[0] for it in items_to_show]
     context.user_data["info_page_collection_id"] = collection_id
     context.user_data["info_page_page"] = page
     context.user_data["info_page_info_page"] = info_page
