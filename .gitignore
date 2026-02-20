@@ -22,3 +22,6 @@ env/
 *.bak
 .idea/
 .vscode/
+
+# PID files
+.bot.pid

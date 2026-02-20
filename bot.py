@@ -5,6 +5,8 @@ Configures logging, restores sessions, and sets up the Telegram application.
 import asyncio
 import logging
 import sys
+import os
+import psutil
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -44,6 +46,38 @@ from handlers import (
     handle_custom_share_expiration_callback, handle_save_custom_share_expiration_callback,
     handle_message
 )
+
+# הגדרת הקובץ
+_LOCKFILE = os.path.join(os.path.dirname(__file__), ".bot.pid")
+
+def _kill_old_instance():
+    """Check for an existing bot instance using a PID file and kill it if found."""
+    if not os.path.exists(_LOCKFILE):
+        return
+    try:
+        with open(_LOCKFILE, "r", encoding="utf-8") as f:
+            old_pid = int(f.read().strip())
+        
+        old_proc = psutil.Process(old_pid)
+        
+        # אימות שזה אכן הבוט שלנו
+        cmdline = " ".join(old_proc.cmdline())
+        if "bot.py" in cmdline:
+            logging.warning("⚠️ Killing old bot instance (PID %d)", old_pid)
+            # סגירת תהליכי בן
+            for child in old_proc.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            try:
+                old_proc.kill() # סגירת הבוט הישן
+                old_proc.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
+    except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+        pass # התהליך כבר לא קיים, הקובץ לא תקין או שאין הרשאות
 
 def setup_logging():
     """Configure bot logging with file and console handlers."""
@@ -224,6 +258,10 @@ def _register_handlers(app):
 
 def main():
     """Start the bot application."""
+    _kill_old_instance()
+    with open(_LOCKFILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
     setup_logging()
     db.init_db()
 
