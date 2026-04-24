@@ -46,6 +46,10 @@ from handlers import (
     handle_select_item_delete_col_callback,
     handle_set_share_expiration_callback, handle_save_share_expiration_callback,
     handle_custom_share_expiration_callback, handle_save_custom_share_expiration_callback,
+    handle_scan_duplicates_callback, handle_confirm_delete_dupes_callback,
+    handle_dupes_page_callback,
+    handle_random_video_scroll_callback,
+    handle_collection_info_callback,
     handle_message
 )
 
@@ -247,6 +251,21 @@ def _register_handlers(app):
     ))
     app.add_handler(CallbackQueryHandler(
         handle_save_custom_share_expiration_callback, pattern="^save_share_exp_custom:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_scan_duplicates_callback, pattern="^scan_duplicates:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_confirm_delete_dupes_callback, pattern="^confirm_delete_dupes:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_dupes_page_callback, pattern="^dupes_page:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_collection_info_callback, pattern="^collection_info:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_random_video_scroll_callback, pattern="^random_video:"
     ))
 
     # Messages

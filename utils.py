@@ -98,48 +98,54 @@ async def parse_and_validate_access(update: Update, context: ContextTypes.DEFAUL
 
 def extract_file_info(message):
     """
-    Extracts file information (content_type, file_id, file_name, file_size, text_content) from a message.
+    Extracts file information from a message.
     Returns dict or None if no supported content found.
     """
     content_type = None
     file_id = None
+    file_unique_id = None
     text_content = message.caption or message.text or ""
     f_name = None
     f_size = 0
-    
+
     if message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
+        file_unique_id = message.photo[-1].file_unique_id
         f_size = message.photo[-1].file_size
-        
+
     elif message.video:
         content_type = "video"
         file_id = message.video.file_id
+        file_unique_id = message.video.file_unique_id
         f_name = message.video.file_name
         f_size = message.video.file_size
-        
+
     elif message.document:
         content_type = "document"
         file_id = message.document.file_id
+        file_unique_id = message.document.file_unique_id
         f_name = message.document.file_name
         f_size = message.document.file_size
-        
+
     elif message.audio:
         content_type = "audio"
         file_id = message.audio.file_id
+        file_unique_id = message.audio.file_unique_id
         f_name = message.audio.file_name
         f_size = message.audio.file_size
-        
+
     elif message.text:
         content_type = "text"
         text_content = message.text
-        
+
     if not content_type:
         return None
-        
+
     return {
         "content_type": content_type,
         "file_id": file_id,
+        "file_unique_id": file_unique_id,
         "text_content": text_content,
         "file_name": f_name,
         "file_size": f_size

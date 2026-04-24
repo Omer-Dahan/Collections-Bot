@@ -87,6 +87,9 @@ def _build_scroll_keyboard(col_id, idx, total):
     if nav:
         kb.append(nav)
     kb.append([InlineKeyboardButton(
+        "🎲", callback_data=f"random_video:{col_id}"
+    )])
+    kb.append([InlineKeyboardButton(
         "🔙 חזור לתפריט דפדוף", callback_data=f"browse_page:{col_id}:1"
     )])
     return InlineKeyboardMarkup(kb)
@@ -103,6 +106,56 @@ async def _send_scroll_item(context, chat_id, item, header, markup):
         await bot.send_document(chat_id=chat_id, document=f_id, caption=header, reply_markup=markup)
     else:
         await bot.send_message(chat_id=chat_id, text=header, reply_markup=markup)
+
+async def handle_random_video_scroll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a random item from the collection in scroll view."""
+    import random
+    query = update.callback_query
+
+    parts = parse_callback_data(query.data, "random_video")
+    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    if not is_allowed:
+        await query.answer("אין גישה.", show_alert=True)
+        return
+
+    total = db.count_items_in_collection(col_id)
+    if total == 0:
+        await query.answer("האוסף ריק.", show_alert=True)
+        return
+
+    # Pick a random index directly - O(1), no heavy query needed
+    random_idx = random.randint(0, total - 1)
+    items = db.get_items_by_collection(col_id, offset=random_idx, limit=1)
+    if not items:
+        await query.answer("שגיאה בטעינת הפריט.", show_alert=True)
+        return
+
+    # Acknowledge the callback only once, after we know we have data
+    await query.answer()
+
+    item = items[0]
+    header = f"🎲 פריט {random_idx + 1} מתוך {total}"
+    if item[3]:  # text_content
+        header += f"\n\n{item[3]}"
+
+    reply_markup = _build_scroll_keyboard(col_id, random_idx, total)
+
+    try:
+        await context.bot.delete_message(
+            chat_id=query.message.chat_id, message_id=query.message.message_id
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    try:
+        await _send_scroll_item(context, query.message.chat_id, item, header, reply_markup)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Error sending random item: %s", e)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id, text=f"שגיאה בטעינת הפריט.\n\n{header}",
+            reply_markup=reply_markup
+        )
+
 
 async def handle_page_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """תצוגת מידע מפורט על קבצים בדף - 10 קבצים בכל פעם"""

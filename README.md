@@ -20,11 +20,14 @@
 |---------|-------------|
 | 📦 **Collections** | Create and manage multiple media collections |
 | ☁️ **Media Storage** | Store photos, videos, documents, audio, and text |
+| 🔍 **Duplicate Scanner** | Identify and remove duplicate files with smart detection |
 | 🔗 **Secure Sharing** | Share collections via unique codes with access tracking |
-| 📊 **Batch Status** | Real-time updates during mass uploads |
+| 📊 **Collection Info** | View detailed stats: item counts by type, sizes, and dates |
+| 📈 **Batch Status** | Real-time updates during mass uploads |
 | 🛡️ **Admin Panel** | Full user management and analytics dashboard |
 | 📝 **Auto-Captions** | Automatically saves captions with media |
-| 👁️ **Browsing** | Native Telegram UI for browsing stored content |
+| 👁️ **Browsing** | Native Telegram UI for browsing content with scroll view |
+| 🎲 **Random Item** | Jump to a random item in your collection with one click |
 | ⚡ **Performance** | Asynchronous design with flood protection |
 
 ---
@@ -77,7 +80,8 @@ Using the bot is simple and intuitive. Here is the basic workflow:
 1.  **Start**: Send `/start` to open the main menu.
 2.  **Create Collection**: Select "📁 New Collection", name it, and it will become "active".
 3.  **Save Content**: Any message you send to the bot (photo, video, file, text) will be automatically saved to the active collection.
-4.  **Manage**: Use the menus to browse, delete, or share your collections.
+4.  **Manage & Browse**: Use the menus to browse, delete, or share. In single-item view, use the `🎲` button to jump to a random item instantly.
+5.  **Collection Info**: In the collection management menu, tap `📊 Collection Info` to view full statistics: video/photo/file counts, size per type, total size, and item dates.
 
 ### 🎮 Available Commands
 
@@ -128,7 +132,9 @@ Collections-bot/
 ├── 📂 handlers/            # 🎮 Logic handlers
 │   ├── 📄 commands.py      # /start, /help, etc.
 │   ├── 📄 callbacks.py     # Button interactions
-│   └── 📄 messages.py      # Media & text handling
+│   ├── 📄 messages.py      # Media & text handling
+│   ├── 📄 browse_handlers.py # Browsing logic
+│   └── 📄 duplicate_handlers.py # Duplicate scanner logic
 ├── 📄 constants.py         # 📝 Constant values
 ├── 📄 message_tracker.py   # 📨 Message tracking
 ├── 📄 requirements.txt     # 📦 Dependencies

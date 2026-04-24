@@ -411,6 +411,78 @@ async def handle_item_delete_message(update: Update, context: ContextTypes.DEFAU
             reply_markup=keyboard, parse_mode="Markdown"
         )
 
+async def handle_duplicate_preview_request(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    If a duplicate scan is pending and the user sends a numeric ID,
+    send the corresponding file as a preview.
+    """
+    if not (message.text and message.text.strip().isdigit()):
+        return False
+
+    pending = context.user_data.get("pending_duplicate_ids")
+    col_id = context.user_data.get("duplicate_scan_col_id")
+
+    if not pending or not col_id:
+        return False
+
+    target_id = int(message.text.strip())
+    # target_id must be either a duplicate or the original of one of the groups.
+    # We allow previewing any item from the scan result — fetch from DB directly.
+    try:
+        item = db.get_item_by_id(target_id)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Duplicate preview fetch error: %s", e)
+        return False
+
+    if not item:
+        # ID was numeric but not found — let other handlers try
+        return False
+
+    # Verify item belongs to the correct collection
+    if item[1] != col_id:
+        return False
+
+    back_button = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🔙 חזור לדוח כפולים",
+            callback_data=f"manage_collection:{col_id}"
+        )]
+    ])
+
+    content_type = item[2]  # (id, collection_id, content_type, file_id, ...)
+    file_id = item[3]
+
+    try:
+        if content_type == "photo":
+            await context.bot.send_photo(
+                chat_id=message.chat_id, photo=file_id,
+                caption=f"🔍 תצוגה מקדימה — ID: `{target_id}`",
+                parse_mode="Markdown", reply_markup=back_button
+            )
+        elif content_type == "video":
+            await context.bot.send_video(
+                chat_id=message.chat_id, video=file_id,
+                caption=f"🔍 תצוגה מקדימה — ID: `{target_id}`",
+                parse_mode="Markdown", reply_markup=back_button
+            )
+        elif content_type == "document":
+            await context.bot.send_document(
+                chat_id=message.chat_id, document=file_id,
+                caption=f"🔍 תצוגה מקדימה — ID: `{target_id}`",
+                parse_mode="Markdown", reply_markup=back_button
+            )
+        else:
+            await message.reply_text(
+                f"סוג קובץ `{content_type}` — ID: `{target_id}`",
+                parse_mode="Markdown", reply_markup=back_button
+            )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Failed to send duplicate preview: %s", e)
+        await message.reply_text(f"❌ שגיאה בשליחת הקובץ (ID: {target_id}).")
+
+    return True
+
+
 async def handle_id_request(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Handle text messages consisting only of digits (retrieving item by ID)."""
     if not (message.text and message.text.isdigit()):
@@ -486,18 +558,20 @@ async def handle_item_addition(message, user, context: ContextTypes.DEFAULT_TYPE
 
     file_info = extract_file_info(message)
     if not file_info:
-        # If it's just general text and not caught by other handlers, don't noise unless we want to.
-        # But usually we return False to allow other potential handlers.
         return False
 
     content_type = file_info["content_type"]
     file_id = file_info["file_id"]
+    file_unique_id = file_info.get("file_unique_id")
     text_content = file_info["text_content"]
     f_name = file_info["file_name"]
     f_size = file_info["file_size"]
 
     try:
-        item_id = db.add_item(collection_id, content_type, file_id, text_content, f_name, f_size)
+        item_id = db.add_item(
+            collection_id, content_type, file_id, text_content,
+            f_name, f_size, file_unique_id=file_unique_id
+        )
         col_data = db.get_collection_by_id(collection_id)
         col_name = col_data[1] if col_data else "Unknown"
 
@@ -528,7 +602,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _handle_intercepts(update, context):
         return
 
-    # 2. File by ID request
+    # 2. Duplicate scan preview (must run before generic id_request)
+    if await handle_duplicate_preview_request(msg, context):
+        return
+
+    # 3. File by ID request
     if await handle_id_request(msg, context):
         return
 

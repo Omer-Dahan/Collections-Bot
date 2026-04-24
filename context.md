@@ -30,8 +30,11 @@ Manages all communication with the `bot_data.db` database.
   - `shared_collection_access_log`: Access log for shared collections.
   - `shared_messages_to_delete`: Tracking messages sent in a shared session for automatic deletion.
 - **Key Functions:**
-  - `add_item(...)`: Adds a file to a collection.
+  - `add_item(...)`: Adds a file to a collection (now stores `file_unique_id`).
   - `get_items_by_collection(...)`: Retrieves items (supports Pagination).
+  - `get_all_items_for_duplicate_scan(...)`: Optimized fetch for deduplication.
+  - `delete_items_by_ids(...)`: Efficient bulk deletion for duplicates.
+  - `get_collection_stats(...)`: Returns detailed stats per collection (counts by type, sizes, first/last item date).
   - `create_share_link(...)`: Generates a unique code for sharing a collection.
   - `check_expired_shares_job`: (Defined in `bot.py` but uses queries from here) for expiration management.
 
@@ -52,7 +55,16 @@ Contains reusable helper functions for the entire project, primarily focused on 
 This directory contains business logic, categorized by topic (inferred from imports in `bot.py`):
 - **Commands (`commands.py`):** `/start`, `/newcollection`, etc.
 - **Callbacks (`callbacks.py`):** Button clicks (browsing, selecting collections, management).
+  - `handle_manage_collection_callback`: Shows management menu including the new 📊 info button.
+  - `handle_collection_info_callback`: Displays detailed stats (counts by type, sizes, first/last item date).
 - **Messages (`messages.py`):** Handling file reception from users and saving to the active collection.
+- **Browse Handlers (`browse_handlers.py`):** Pagination, page viewing, batch sending.
+  - **Single Item View (Scroll View):** Navigation between individual items (Next/Back).
+  - **Random Item:** Jump to a random item in the collection using the `🎲` button (handled by `handle_random_video_scroll_callback`). Uses efficient O(1) random offset picking.
+- **Duplicate Handlers (`duplicate_handlers.py`):** Advanced deduplication logic.
+  - **Deduplication:** Uses `file_unique_id` (Telegram-native) for 100% accuracy on new items, and `file_size` as a fallback for legacy items.
+  - **UI:** Paginated report (30 groups per page) with navigation and bulk deletion.
+  - **Interaction:** Allows users to preview items by sending their ID from the report.
 
 ---
 
@@ -74,6 +86,7 @@ This directory contains business logic, categorized by topic (inferred from impo
 3. Upon collection selection, the bot calls `show_collection_page`.
 4. The function calculates pages (based on 100 items per virtual page, divided into groups of 10).
 5. User sees a menu with numbers (1..10). Clicking a number sends that batch of files (`send_media_groups_in_chunks`).
+6. **Scroll View & Random Item:** While viewing a single item, users can navigate sequentially or click the `🎲` button to jump to a random item in the collection instantly.
 
 ### C. Sharing a Collection
 1. User enters collection management and selects "Share".
@@ -84,6 +97,25 @@ This directory contains business logic, categorized by topic (inferred from impo
 
 ### D. Background Tasks
 - `check_expired_shares_job`: Runs every minute. Checks for expired shares in DB, deletes messages sent to viewers, and invalidates the access code.
+
+### E. Collection Info
+1. User enters "Manage Collections" and selects a collection.
+2. The management menu now includes a **📊 Collection Info** button.
+3. Clicking it calls `handle_collection_info_callback`, which fetches stats via `db.get_collection_stats()`.
+4. The bot displays: total items, breakdown by type (videos/photos/files/text), size per type, total size, and the date of the first and last added item.
+
+### F. Random Item in Scroll View
+1. While browsing an item in scroll view (`handle_scroll_view_callback`), a **🎲** button is shown.
+2. Clicking it calls `handle_random_video_scroll_callback`, which picks a random index from all items in the collection.
+3. The bot fetches that item and displays it, replacing the current scroll view message.
+
+### G. Duplicate Scanning & Removal
+1. User triggers "Scan Duplicates" from a collection's management menu.
+2. Bot fetches metadata for all files and groups them using `file_unique_id` (or `file_size` for legacy items).
+3. A paginated report is generated (30 groups/page). User can navigate using buttons.
+4. User can send an ID from the report to see a preview of the file (handled via `messages.py`).
+5. User confirms deletion; bot removes all items except the first one ("original") in each group.
+6. Database is cleaned up, and user receives a final count of deleted items and remaining storage.
 
 ### E. Release Management
 1. After every feature implementation or bug fix, the `/track-changes` workflow must be executed.

@@ -90,6 +90,16 @@ def migrate_db():
         conn.commit()
         print("Migration complete. Added expires_at column.")
     
+    # Add file_unique_id column to items table if missing
+    cur.execute("PRAGMA table_info(items)")
+    item_columns = [info[1] for info in cur.fetchall()]
+
+    if "file_unique_id" not in item_columns:
+        print("Migrating database: Adding file_unique_id to items...")
+        cur.execute("ALTER TABLE items ADD COLUMN file_unique_id TEXT")
+        conn.commit()
+        print("Migration complete. Existing items will have NULL file_unique_id.")
+
     # Add unique index on shared_messages_to_delete for INSERT OR IGNORE support
     try:
         cur.execute("""
@@ -122,6 +132,7 @@ def init_db():
         collection_id INTEGER NOT NULL,
         content_type TEXT NOT NULL,  -- "video", "photo", "document", "text"
         file_id TEXT,
+        file_unique_id TEXT,
         text_content TEXT,
         file_name TEXT,
         file_size INTEGER,
@@ -228,15 +239,19 @@ def add_item(
     text_content: str | None = None,
     file_name: str | None = None,
     file_size: int | None = None,
+    file_unique_id: str | None = None,
 ) -> int:
     added_at = datetime.now().isoformat()
     with db_transaction() as (conn, cur):
         cur.execute(
             """
-            INSERT INTO items (collection_id, content_type, file_id, text_content, file_name, file_size, added_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items
+                (collection_id, content_type, file_id, file_unique_id,
+                 text_content, file_name, file_size, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (collection_id, content_type, file_id, text_content, file_name, file_size, added_at)
+            (collection_id, content_type, file_id, file_unique_id,
+             text_content, file_name, file_size, added_at)
         )
         return cur.lastrowid
 
@@ -281,7 +296,6 @@ def count_items_in_collection(collection_id: int) -> int:
         )
         (count,) = cur.fetchone()
         return count
-
 
 
 # delete_item_by_id removed (dead code)
@@ -938,3 +952,127 @@ def deactivate_share_by_code(share_code: str) -> bool:
 
 
 # count_active_shares_with_expiration removed (dead code)
+
+
+# --- Duplicate Scanner Functions ---
+
+def get_all_items_for_duplicate_scan(collection_id: int) -> list:
+    """
+    Fetch all items in a collection that are eligible for duplicate detection.
+    Only returns items with a file_id (skips text-only items).
+
+    Returns:
+        List of tuples: (id, content_type, file_id, file_size, file_name, file_unique_id)
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            """
+            SELECT id, content_type, file_id, file_size, file_name, file_unique_id
+            FROM items
+            WHERE collection_id = ? AND file_id IS NOT NULL
+            ORDER BY id
+            """,
+            (collection_id,)
+        )
+        return cur.fetchall()
+
+
+def delete_items_by_ids(item_ids: list[int]) -> int:
+    """
+    Delete multiple items by their IDs in a single transaction.
+
+    Args:
+        item_ids: List of item IDs to delete
+
+    Returns:
+        Number of rows deleted
+    """
+    if not item_ids:
+        return 0
+    placeholders = ",".join("?" * len(item_ids))
+    with db_transaction() as (conn, cur):
+        cur.execute(
+            f"DELETE FROM items WHERE id IN ({placeholders})",
+            item_ids
+        )
+        return cur.rowcount
+
+
+def get_collection_stats(collection_id: int) -> dict:
+    """
+    Get detailed statistics for a collection.
+
+    Returns a dict with:
+        - created_at: ISO datetime string of the earliest item added (or None)
+        - collection_created_at: (not stored in DB directly, so same as first item)
+        - video_count: number of video items
+        - photo_count: number of photo items
+        - document_count: number of document items
+        - text_count: number of text-only items
+        - total_count: total items
+        - video_duration_seconds: total video duration in seconds (always 0 — Telegram doesn't store it)
+        - video_size_bytes: total size of video files
+        - photo_size_bytes: total size of photo files
+        - document_size_bytes: total size of document files
+        - total_size_bytes: total size of all files
+        - first_item_date: ISO datetime of first added item
+        - last_item_date: ISO datetime of most recently added item
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        # Per-type counts and sizes
+        cur.execute(
+            """
+            SELECT
+                content_type,
+                COUNT(*) as cnt,
+                SUM(COALESCE(file_size, 0)) as total_size
+            FROM items
+            WHERE collection_id = ?
+            GROUP BY content_type
+            """,
+            (collection_id,)
+        )
+        rows = cur.fetchall()
+
+        stats = {
+            "video_count": 0,
+            "photo_count": 0,
+            "document_count": 0,
+            "text_count": 0,
+            "total_count": 0,
+            "video_size_bytes": 0,
+            "photo_size_bytes": 0,
+            "document_size_bytes": 0,
+            "total_size_bytes": 0,
+            "first_item_date": None,
+            "last_item_date": None,
+        }
+
+        for content_type, cnt, total_size in rows:
+            size = total_size or 0
+            stats["total_count"] += cnt
+            stats["total_size_bytes"] += size
+            if content_type == "video":
+                stats["video_count"] = cnt
+                stats["video_size_bytes"] = size
+            elif content_type == "photo":
+                stats["photo_count"] = cnt
+                stats["photo_size_bytes"] = size
+            elif content_type == "document":
+                stats["document_count"] = cnt
+                stats["document_size_bytes"] = size
+            elif content_type == "text":
+                stats["text_count"] = cnt
+
+        # First and last item dates
+        cur.execute(
+            "SELECT MIN(added_at), MAX(added_at) FROM items WHERE collection_id = ?",
+            (collection_id,)
+        )
+        date_row = cur.fetchone()
+        if date_row:
+            stats["first_item_date"] = date_row[0]
+            stats["last_item_date"] = date_row[1]
+
+        return stats
+

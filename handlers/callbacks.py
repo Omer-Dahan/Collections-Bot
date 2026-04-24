@@ -269,10 +269,16 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
     if not is_admin_v:
         keyboard = [
             [InlineKeyboardButton(
+                "📊 מידע על האוסף", callback_data=f"collection_info:{col_id}"
+            )],
+            [InlineKeyboardButton(
                 "📤 ייצוא לקובץ (גיבוי)", callback_data=f"export_collection:{col_id}"
             )],
             [InlineKeyboardButton(
                 "🔗 יצירת קישור שיתוף", callback_data=f"share_collection:{col_id}"
+            )],
+            [InlineKeyboardButton(
+                "🔎 סריקת קבצים כפולים", callback_data=f"scan_duplicates:{col_id}"
             )],
             [InlineKeyboardButton(
                 "🗑 מחיקת אוסף", callback_data=f"delete_collection:{col_id}"
@@ -281,6 +287,9 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
         ]
     else:
         keyboard = [
+            [InlineKeyboardButton(
+                "📊 מידע על האוסף", callback_data=f"collection_info:{col_id}"
+            )],
             [InlineKeyboardButton(
                 "📂 צפייה בתוכן (Admin)", callback_data=f"browse_page:{col_id}:1"
             )],
@@ -295,6 +304,77 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+
+async def handle_collection_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed statistics about a collection."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = parse_callback_data(query.data, "collection_info")
+    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    if not is_allowed:
+        return
+
+    stats = db.get_collection_stats(col_id)
+
+    def fmt_size(size_bytes: int) -> str:
+        """Format bytes into a human-readable string."""
+        if size_bytes == 0:
+            return "0 B"
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} TB"
+
+    def fmt_date(iso_str: str | None) -> str:
+        """Format an ISO datetime string to a readable short date."""
+        if not iso_str:
+            return "לא ידוע"
+        try:
+            return iso_str[:16].replace("T", " ")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return iso_str
+
+    lines = [
+        f"📊 **מידע על האוסף: {col[1]}**\n",
+        f"📦 **סה\"כ פריטים:** {stats['total_count']}",
+    ]
+
+    if stats["video_count"] > 0:
+        lines.append(
+            f"🎬 **סרטונים:** {stats['video_count']} "
+            f"({fmt_size(stats['video_size_bytes'])})"
+        )
+
+    if stats["photo_count"] > 0:
+        lines.append(
+            f"🖼 **תמונות:** {stats['photo_count']} "
+            f"({fmt_size(stats['photo_size_bytes'])})"
+        )
+
+    if stats["document_count"] > 0:
+        lines.append(
+            f"📄 **קבצים:** {stats['document_count']} "
+            f"({fmt_size(stats['document_size_bytes'])})"
+        )
+
+    if stats["text_count"] > 0:
+        lines.append(f"💬 **הודעות טקסט:** {stats['text_count']}")
+
+    lines.append(f"\n💾 **גודל כולל:** {fmt_size(stats['total_size_bytes'])}")
+
+    lines.append(f"\n📅 **פריט ראשון נוסף:** {fmt_date(stats['first_item_date'])}")
+    lines.append(f"🕐 **פריט אחרון נוסף:** {fmt_date(stats['last_item_date'])}")
+
+    text = "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
+    ])
+
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 async def handle_share_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate or display share code for a collection."""
