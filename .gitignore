@@ -25,3 +25,7 @@ env/
 
 # PID files
 .bot.pid
+
+# Documentation (as per user rules)
+*.md
+!README.md

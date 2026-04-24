@@ -6,7 +6,9 @@ import asyncio
 import logging
 import sys
 import os
+import time
 import psutil
+import subprocess
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -51,33 +53,28 @@ from handlers import (
 _LOCKFILE = os.path.join(os.path.dirname(__file__), ".bot.pid")
 
 def _kill_old_instance():
-    """Check for an existing bot instance using a PID file and kill it if found."""
+    """Kill any previous bot instance that's still running."""
     if not os.path.exists(_LOCKFILE):
         return
     try:
-        with open(_LOCKFILE, "r", encoding="utf-8") as f:
-            old_pid = int(f.read().strip())
-        
+        old_pid = int(open(_LOCKFILE).read().strip())
+        if old_pid == os.getpid():
+            return
         old_proc = psutil.Process(old_pid)
-        
-        # אימות שזה אכן הבוט שלנו
+        # Verify it's actually our bot (not some other process reusing the PID)
         cmdline = " ".join(old_proc.cmdline())
         if "bot.py" in cmdline:
-            logging.warning("⚠️ Killing old bot instance (PID %d)", old_pid)
-            # סגירת תהליכי בן
+            logging.warning("⚠️ Killing old bot instance (PID %d) to prevent database lock", old_pid)
+            # Kill children first (sub-processes)
             for child in old_proc.children(recursive=True):
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            
-            try:
-                old_proc.kill() # סגירת הבוט הישן
-                old_proc.wait(timeout=5)
-            except psutil.NoSuchProcess:
-                pass
-    except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
-        pass # התהליך כבר לא קיים, הקובץ לא תקין או שאין הרשאות
+                child.kill()
+            old_proc.kill()
+            old_proc.wait(timeout=5)
+            logging.info("✅ Old instance killed successfully")
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        pass  # Process already gone or can't access
+    except Exception as e:
+        logging.warning("Could not kill old instance: %s", e)
 
 def setup_logging():
     """Configure bot logging with file and console handlers."""
@@ -258,7 +255,10 @@ def _register_handlers(app):
 
 def main():
     """Start the bot application."""
+    # Kill previous instance if exists
     _kill_old_instance()
+    
+    # Write our current PID to the lock file
     with open(_LOCKFILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
 

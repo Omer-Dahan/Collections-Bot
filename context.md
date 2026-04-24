@@ -85,6 +85,11 @@ This directory contains business logic, categorized by topic (inferred from impo
 ### D. Background Tasks
 - `check_expired_shares_job`: Runs every minute. Checks for expired shares in DB, deletes messages sent to viewers, and invalidates the access code.
 
+### E. Release Management
+1. After every feature implementation or bug fix, the `/track-changes` workflow must be executed.
+2. This workflow records a concise summary in `CHANGELOG_PENDING.md`.
+3. This ensures that when a new version is released on GitHub, all changes are already documented and ready for the release notes.
+
 ---
 
 ## Summary
