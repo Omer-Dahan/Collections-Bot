@@ -363,39 +363,71 @@ def verify_user_code(message, context: ContextTypes.DEFAULT_TYPE, action_type: s
 def prepare_media_groups(items: list) -> tuple[list, list, list]:
     """
     Prepare media items into visual and document groups.
+    Caption is set to None when empty to avoid Telegram API errors.
     """
     media_visual = []
     media_docs = []
     text_items = []
-    
+
     for _, content_type, file_id, text_content, file_name, _, _ in items:
         # Handle text items (no file_id)
         if content_type == "text" or (not file_id and text_content):
             text_items.append(text_content)
             continue
-            
+
         if not file_id:
             continue
-            
+
+        # Normalize empty captions to None — empty string can cause API errors
+        caption = text_content if text_content else None
+        # Telegram caption limit for media groups is 1024 characters
+        if caption and len(caption) > 1024:
+            caption = caption[:1021] + "..."
+
         if content_type == "video":
-            media_visual.append(InputMediaVideo(media=file_id, caption=text_content))
+            media_visual.append(InputMediaVideo(media=file_id, caption=caption))
         elif content_type == "photo":
-            media_visual.append(InputMediaPhoto(media=file_id, caption=text_content))
+            media_visual.append(InputMediaPhoto(media=file_id, caption=caption))
         elif content_type == "document":
-            media_docs.append(InputMediaDocument(media=file_id, filename=file_name, caption=text_content))
-    
+            media_docs.append(InputMediaDocument(media=file_id, filename=file_name, caption=caption))
+
     return media_visual, media_docs, text_items
+
+async def _send_item_individually(bot, chat_id: int, item) -> list:
+    """
+    Fallback: send a single InputMedia object as an individual message.
+    Returns a list with the Message object, or empty list on failure.
+    """
+    try:
+        file_id = item.media
+        caption = getattr(item, 'caption', None)
+        if isinstance(item, InputMediaVideo):
+            msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
+        elif isinstance(item, InputMediaPhoto):
+            msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
+        elif isinstance(item, InputMediaDocument):
+            msg = await bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+        else:
+            return []
+        return [msg]
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Individual send also failed for file_id %s: %s",
+                     getattr(item, 'media', '?'), e)
+        return []
+
 
 async def safe_send_media_group(bot, chat_id: int, media: list, retries: int = 3) -> list:
     """
     Safe wrapper for send_media_group that handles RetryAfter errors.
-    
+    When media_file_invalid is encountered, falls back to sending each item
+    individually so one bad file_id cannot block the entire group.
+
     Args:
         bot: The bot instance
         chat_id: Target chat ID
         media: List of InputMedia objects
         retries: Number of retry attempts
-        
+
     Returns:
         List of Message objects sent, or empty list on failure
     """
@@ -409,11 +441,26 @@ async def safe_send_media_group(bot, chat_id: int, media: list, retries: int = 3
                            wait_time, attempt + 1, retries)
             await asyncio.sleep(wait_time)
         except Exception as e:
+            error_str = str(e)
             logger.error("Error sending media group (attempt %s/%s): %s",
                          attempt + 1, retries, e)
+            # media_file_invalid means one of the file_ids is broken — retrying
+            # the same group will keep failing. Fall back to individual sends so
+            # valid files still reach the user.
+            if "media_file_invalid" in error_str:
+                logger.warning(
+                    "media_file_invalid detected — switching to individual sends "
+                    "for this group of %d items", len(media)
+                )
+                sent = []
+                for item in media:
+                    msgs = await _send_item_individually(bot, chat_id, item)
+                    sent.extend(msgs)
+                    await asyncio.sleep(0.3)
+                return sent
             if attempt < retries - 1:
                 await asyncio.sleep(2)
-    
+
     return []
 
 

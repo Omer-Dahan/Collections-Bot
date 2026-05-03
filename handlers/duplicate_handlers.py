@@ -61,13 +61,13 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
             continue
 
         if file_unique_id:
-            # Reliable path
-            key = (content_type, file_unique_id)
+            # Reliable path: consider file name as well to prevent false positives if user renamed identical files
+            key = (content_type, file_unique_id, file_name)
             reliable.setdefault(key, []).append(item)
             reliable_count += 1
         elif file_size is not None:
-            # Fallback path for legacy items
-            key = (content_type, file_size)
+            # Fallback path for legacy items: include file name to prevent grouping split archives with identical sizes
+            key = (content_type, file_size, file_name)
             fallback.setdefault(key, []).append(item)
             fallback_count += 1
         # else: no usable data — skip
@@ -98,7 +98,7 @@ _TYPE_EMOJI = {
     "audio": "🎵",
 }
 
-_PAGE_SIZE = 30          # duplicate groups per page
+_PAGE_SIZE = 10          # duplicate groups per page (reduced to prevent Message_too_long)
 _GROUPS_KEY = "duplicate_groups_cache"   # key in context.user_data
 
 
@@ -140,10 +140,15 @@ def _build_page_text(
         count = len(group)
         lines.append(f"\n{emoji} *קבוצה {global_idx}* ({content_type}) — {count} עותקים")
 
-        for pos, item in enumerate(group):
+        # Limit displayed items to prevent exceeding Telegram's 4096 character limit
+        display_limit = 5
+        for pos, item in enumerate(group[:display_limit]):
             item_id = item[0]
             label = "✅ מקור " if pos == 0 else "❌ כפול"
             lines.append(f"  {label} | ID: `{item_id}`")
+            
+        if count > display_limit:
+            lines.append(f"  ... ועוד {count - display_limit} עותקים לא מוצגים")
 
     return "\n".join(lines)
 

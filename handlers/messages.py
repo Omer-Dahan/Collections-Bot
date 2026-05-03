@@ -595,7 +595,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main generic message handler for tracking input and matching modes."""
     user = update.effective_user
     if user:
-        db.upsert_user(user.id, user.username, user.first_name, user.last_name)
+        if db.upsert_user(user.id, user.username, user.first_name, user.last_name):
+            return
     msg = update.message
 
     # 1. Intercepting flows

@@ -686,3 +686,193 @@ async def delete_collection_action(query, context: ContextTypes.DEFAULT_TYPE, co
             "❌ שגיאה במחיקת האוסף.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")]])
         )
+
+
+# === File ID Scan ===
+
+# Error substrings that confirm a file_id is truly invalid (not a network hiccup)
+_INVALID_FILE_ERRORS = (
+    "wrong file_id",
+    "file_id_invalid",
+    "media_file_invalid",
+    "bad request: wrong",
+    "invalid file_id",
+    "file not found",
+)
+
+def _is_invalid_file_error(err: str) -> bool:
+    """Return True only when the error clearly means the file_id is broken."""
+    low = err.lower()
+    return any(kw in low for kw in _INVALID_FILE_ERRORS)
+
+
+async def _check_file_id(bot, fid: str, c_type: str) -> bool:
+    """
+    Return True if the file_id is still usable by this bot.
+    Uses get_file() which works for all types, but gracefully handles
+    the 20-MB limit: a FileTooLarge response means the id IS valid.
+    """
+    try:
+        await bot.get_file(fid)
+        return True  # success
+    except Exception as e:
+        err = str(e)
+        # "file is too big" / "FileTooLarge" → file exists, just too big to download
+        if "too big" in err.lower() or "file_too_big" in err.lower():
+            return True
+        # Definitively invalid
+        if _is_invalid_file_error(err):
+            return False
+        # Unknown error (network, timeout) → assume valid, don't count as broken
+        return True
+
+
+async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command /scanfiles — checks which stored file_ids are no longer valid.
+
+    Usage:
+        /scanfiles                   → scan all items (warns if >500)
+        /scanfiles <col_id>          → scan a specific collection
+        /scanfiles <col_id> <limit>  → scan at most <limit> items from that collection
+        /scanfiles all <limit>       → scan at most <limit> items from the whole DB
+    """
+    import asyncio as _asyncio
+
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ אין לך הרשאות.")
+        return
+
+    # ── Parse arguments ──────────────────────────────────────────────
+    args = context.args or []
+    target_col_id = None
+    item_limit = None  # None = no limit
+
+    if args:
+        first = args[0]
+        if first.lower() != "all":
+            try:
+                target_col_id = int(first)
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ שימוש:\n"
+                    "/scanfiles\n"
+                    "/scanfiles <col_id>\n"
+                    "/scanfiles <col_id> <limit>\n"
+                    "/scanfiles all <limit>"
+                )
+                return
+        if len(args) >= 2:
+            try:
+                item_limit = max(1, int(args[1]))
+            except ValueError:
+                await update.message.reply_text("❌ limit חייב להיות מספר שלם חיובי.")
+                return
+
+    # ── Fetch items ───────────────────────────────────────────────────
+    if target_col_id is not None:
+        col = db.get_collection_by_id(target_col_id)
+        if not col:
+            await update.message.reply_text(f"❌ אוסף {target_col_id} לא נמצא.")
+            return
+        raw = db.get_items_by_collection(target_col_id, limit=100_000)
+        # get_items_by_collection returns: (id, content_type, file_id, ...)
+        all_items = [(r[0], r[1], r[2]) for r in raw if r[2]]
+        scope_label = f"אוסף #{target_col_id} ({col[1]})"
+    else:
+        all_items = db.get_all_file_items()   # returns (id, content_type, file_id)
+        scope_label = "כל המאגר"
+
+    if item_limit:
+        file_items = all_items[:item_limit]
+        scope_label += f" (ראשונים {item_limit})"
+    else:
+        file_items = all_items
+
+    total = len(file_items)
+    if total == 0:
+        await update.message.reply_text("אין פריטים עם file_id לסריקה.")
+        return
+
+    # ── ETA estimate (0.07s per item including network round-trip) ────
+    DELAY = 0.05  # seconds between requests
+    est_seconds = int(total * (DELAY + 0.07))
+    if est_seconds < 60:
+        eta_str = f"~{est_seconds} שניות"
+    else:
+        eta_str = f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות"
+
+    # Warn if no limit was given and collection is large
+    if item_limit is None and total > 500:
+        await update.message.reply_text(
+            f"⚠️ <b>שים לב:</b> יש {total:,} פריטים לסריקה — זמן משוער: {eta_str}.\n\n"
+            f"טיפ: השתמש ב-\n"
+            f"<code>/scanfiles {target_col_id or 'all'} 200</code>\n"
+            f"כדי לסרוק רק את 200 הפריטים הראשונים.\n\n"
+            f"שלח את הפקודה שוב עם limit אם תרצה להגביל.",
+            parse_mode="HTML"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
+        f"סורק {total:,} פריטים | זמן משוער: {eta_str}\n"
+        f"0 / {total:,}",
+        parse_mode="HTML"
+    )
+
+    # ── Scan loop ─────────────────────────────────────────────────────
+    invalid_ids = []  # list of (item_id, content_type, file_id)
+    checked = 0
+    UPDATE_EVERY = max(10, total // 20)  # update ~20 times during scan
+
+    for item_id, c_type, fid in file_items:
+        is_valid = await _check_file_id(context.bot, fid, c_type)
+        if not is_valid:
+            invalid_ids.append((item_id, c_type, fid))
+        checked += 1
+        await _asyncio.sleep(DELAY)
+
+        if checked % UPDATE_EVERY == 0 or checked == total:
+            pct = int(checked / total * 100)
+            try:
+                await status_msg.edit_text(
+                    f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
+                    f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
+                    f"❌ לא תקינים עד כה: {len(invalid_ids)}",
+                    parse_mode="HTML"
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
+    # ── Build final report ────────────────────────────────────────────
+    invalid_count = len(invalid_ids)
+    valid_count = total - invalid_count
+
+    type_breakdown: dict = {}
+    for _, c_type, _ in invalid_ids:
+        type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
+
+    breakdown_lines = "\n".join(
+        f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
+    ) or "  —"
+
+    report = (
+        f"📋 <b>דוח סריקת file_ids</b>\n"
+        f"היקף: {scope_label}\n\n"
+        f"📦 נסרקו: {total:,}\n"
+        f"✅ תקינים: {valid_count:,}\n"
+        f"❌ לא תקינים: {invalid_count}\n\n"
+        f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
+    )
+
+    if invalid_ids:
+        sample = invalid_ids[:20]
+        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct, _ in sample)
+        report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
+        if invalid_count > 20:
+            report += f"\n  ... ועוד {invalid_count - 20} נוספים"
+
+    await status_msg.edit_text(report, parse_mode="HTML")
+

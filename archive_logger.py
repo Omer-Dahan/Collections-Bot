@@ -24,9 +24,9 @@ ADMIN_ACTIVITY_CHANNEL = -1003542497376  # ערוץ מידע - בוט אוספי
 # Feature toggle
 ENABLE_ARCHIVING = True
 
-# Rate limiting - minimal delays for activity logging only
-ACTIVITY_LOG_DELAY = 0.3  # seconds between activity logs (reduced from 2.0)
-RETRY_EXTRA_DELAY = 2.0  # extra delay after a retry (reduced from 5.0)
+# Rate limiting - delays for activity logging
+ACTIVITY_LOG_DELAY = 1.0  # seconds between activity logs (helps avoid 429 bursts)
+RETRY_EXTRA_DELAY = 5.0   # extra delay after a RetryAfter error
 
 logger = logging.getLogger(__name__)
 
@@ -219,29 +219,29 @@ async def log_activity(
     """
     if not ENABLE_ARCHIVING:
         return
-    
-    async with _archive_lock:
-        try:
-            log_text = format_activity_log(
-                action, user_id, success, 
-                collection_id, collection_name,
-                item_id, extra,
-                user_name, username
-            )
-            # Use unified send function with content_type="text"
-            await safe_copy_file_to_channel(
-                bot=bot,
-                channel_id=ADMIN_ACTIVITY_CHANNEL,
-                file_id=None,
-                content_type="text",
-                caption=log_text,
-                reply_markup=reply_markup
-            )
-            # Small delay to avoid rate limits
-            await asyncio.sleep(ACTIVITY_LOG_DELAY)
-        except Exception as e:
-            # Never let activity logging crash the main flow
-            logger.error(f"Activity log failed: {e}")
+
+    # No lock needed here - this is a single fire-and-forget send, not shared state
+    try:
+        log_text = format_activity_log(
+            action, user_id, success,
+            collection_id, collection_name,
+            item_id, extra,
+            user_name, username
+        )
+        # Use unified send function with content_type="text"
+        await safe_copy_file_to_channel(
+            bot=bot,
+            channel_id=ADMIN_ACTIVITY_CHANNEL,
+            file_id=None,
+            content_type="text",
+            caption=log_text,
+            reply_markup=reply_markup
+        )
+        # Delay after send to reduce burst 429s
+        await asyncio.sleep(ACTIVITY_LOG_DELAY)
+    except Exception as e:
+        # Never let activity logging crash the main flow
+        logger.error(f"Activity log failed: {e}")
 
 async def _do_archive_file(
     bot: Bot,
@@ -363,5 +363,6 @@ async def _process_archive_queue_safe():
             await asyncio.sleep(ACTIVITY_LOG_DELAY)
     except Exception as e:
         logger.error(f"Queue processor crashed: {e}")
+    finally:
         async with _archive_lock:
             _queue_processor_running = False

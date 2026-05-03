@@ -301,6 +301,23 @@ def count_items_in_collection(collection_id: int) -> int:
 # delete_item_by_id removed (dead code)
 
 
+def get_all_file_items() -> list:
+    """
+    Return all items that have a file_id (excludes pure text items).
+    Used for file validity scanning.
+    Returns list of (item_id, content_type, file_id).
+    """
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            """
+            SELECT id, content_type, file_id
+            FROM items
+            WHERE file_id IS NOT NULL AND file_id != ''
+            ORDER BY id
+            """
+        )
+        return cur.fetchall()
+
 
 # delete_items_by_file_id removed (dead code)
 
@@ -362,6 +379,7 @@ def delete_item(collection_id: int, file_id: str) -> bool:
             cur.execute("DELETE FROM items WHERE collection_id = ? AND file_id = ?", (collection_id, file_id))
             return cur.rowcount > 0
         except Exception:
+            logger.exception("delete_item failed (collection_id=%s, file_id=%s)", collection_id, file_id)
             return False
 
 
@@ -462,31 +480,28 @@ def get_global_stats() -> dict:
         }
 
 
-def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None):
-    """Insert or update user details."""
+def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None) -> bool:
+    """Insert or update user details. Returns True if user is blocked."""
     from datetime import datetime
-    import logging
-    logger = logging.getLogger(__name__)
 
     with db_transaction() as (conn, cur):
-        # Check if user exists
-        cur.execute("SELECT first_seen FROM users WHERE user_id = ?", (user_id,))
+        cur.execute("SELECT first_seen, blocked FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
-        
+
         if row:
-            # Update existing
             cur.execute("""
-                UPDATE users 
+                UPDATE users
                 SET username = ?, first_name = ?, last_name = ?
                 WHERE user_id = ?
             """, (username, first_name, last_name, user_id))
+            return bool(row[1])
         else:
-            # Insert new
             first_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cur.execute("""
                 INSERT INTO users (user_id, username, first_name, last_name, first_seen)
                 VALUES (?, ?, ?, ?, ?)
             """, (user_id, username, first_name, last_name, first_seen))
+            return False
 
 
 def get_user(user_id: int):
@@ -945,7 +960,7 @@ def deactivate_share_by_code(share_code: str) -> bool:
                 WHERE share_code = ?
             """, (share_code,))
             rows = cur.rowcount
-            conn.commit() # Explicit commit
+            # commit handled by db_transaction()
             return rows > 0
     except Exception:
         return False

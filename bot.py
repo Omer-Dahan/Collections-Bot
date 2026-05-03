@@ -24,7 +24,7 @@ from telegram.request import HTTPXRequest
 
 import db
 from config import BOT_TOKEN
-from admin_panel import admin_panel, handle_admin_callback
+from admin_panel import admin_panel, handle_admin_callback, scan_file_ids
 from utils import error_handler, UserActionFilter, logger
 from constants import active_shared_collections
 from handlers import (
@@ -180,6 +180,7 @@ def _register_handlers(app):
     app.add_handler(CommandHandler("access", access_shared))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
+    app.add_handler(CommandHandler("scanfiles", scan_file_ids))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_main_menu_button, pattern="^main_menu:"))
@@ -295,7 +296,8 @@ def main():
     logger.info("Bot starting...")
 
     req = HTTPXRequest(connection_pool_size=8, read_timeout=60.0, write_timeout=60.0)
-    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).request(req) \
+    # max_retries=3: retry up to 3 times on 429 flood control instead of crashing immediately
+    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter(max_retries=3)).request(req) \
         .post_init(post_init).build()
 
     _register_handlers(app)

@@ -132,8 +132,9 @@ async def handle_stop_collect_callback(update: Update, context: ContextTypes.DEF
                 [InlineKeyboardButton("🏠 תפריט ראשי", callback_data="back_to_main")]
             ])
         )
-    except Exception: # pylint: disable=broad-exception-caught
-        pass
+    except Exception as e: # pylint: disable=broad-exception-caught
+        if "message is not modified" not in str(e).lower():
+            logger.debug("Could not edit batch stop message: %s", e)
 
 async def handle_delete_select_collection_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -789,9 +790,9 @@ async def handle_custom_share_expiration_callback(
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
-    except Exception: # pylint: disable=broad-exception-caught
-        # Ignore if content is same
-        pass
+    except Exception as e: # pylint: disable=broad-exception-caught
+        if "message is not modified" not in str(e).lower():
+            logger.debug("Could not edit expiry time message: %s", e)
 
 
 async def handle_save_custom_share_expiration_callback(
