@@ -1,6 +1,6 @@
 # db.py
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from config import ADMIN_IDS
 
@@ -316,6 +316,37 @@ def get_all_file_items() -> list:
             ORDER BY id
             """
         )
+        return cur.fetchall()
+
+
+def count_file_items(collection_id: int | None = None) -> int:
+    """Count file-backed items without materializing their file IDs."""
+    with db_transaction(commit=False) as (conn, cur):
+        query = "SELECT COUNT(*) FROM items WHERE file_id IS NOT NULL AND file_id != ''"
+        params = ()
+        if collection_id is not None:
+            query += " AND collection_id = ?"
+            params = (collection_id,)
+        cur.execute(query, params)
+        return cur.fetchone()[0]
+
+
+def get_file_items_page(
+    offset: int = 0, limit: int = 200, collection_id: int | None = None
+) -> list:
+    """Read a bounded page of file IDs for administrative validation."""
+    with db_transaction(commit=False) as (conn, cur):
+        query = """
+            SELECT id, content_type, file_id
+            FROM items
+            WHERE file_id IS NOT NULL AND file_id != ''
+        """
+        params: tuple = ()
+        if collection_id is not None:
+            query += " AND collection_id = ?"
+            params = (collection_id,)
+        query += " ORDER BY id LIMIT ? OFFSET ?"
+        cur.execute(query, params + (limit, offset))
         return cur.fetchall()
 
 
@@ -913,7 +944,7 @@ def get_expired_shares() -> list:
         return cur.fetchall()
 
 
-def get_messages_for_share(share_code: str) -> list:
+def get_messages_for_share(share_code: str, limit: int = 100) -> list:
     """
     Get all tracked messages for a share code.
     
@@ -925,7 +956,8 @@ def get_messages_for_share(share_code: str) -> list:
             SELECT DISTINCT user_id, chat_id, message_id
             FROM shared_messages_to_delete
             WHERE share_code = ?
-        """, (share_code,))
+            LIMIT ?
+        """, (share_code, limit))
         return cur.fetchall()
 
 
@@ -942,6 +974,23 @@ def delete_single_message_record(message_id: int, chat_id: int) -> int:
             WHERE message_id = ? AND chat_id = ?
         """, (message_id, chat_id))
         return cur.rowcount
+
+
+def purge_old_share_data(access_log_days: int = 90) -> tuple[int, int]:
+    """Remove tracking rows for inactive shares and old access-log history."""
+    with db_transaction() as (conn, cur):
+        cur.execute("""
+            DELETE FROM shared_messages_to_delete
+            WHERE share_code IN (
+                SELECT share_code FROM shared_collections WHERE is_active = 0
+            )
+        """)
+        message_rows = cur.rowcount
+        cutoff = (datetime.now() - timedelta(days=access_log_days)).isoformat()
+        cur.execute(
+            "DELETE FROM shared_collection_access_log WHERE accessed_at < ?", (cutoff,)
+        )
+        return message_rows, cur.rowcount
 
 
 def deactivate_share_by_code(share_code: str) -> bool:
@@ -976,18 +1025,47 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
     Fetch all items in a collection that are eligible for duplicate detection.
     Only returns items with a file_id (skips text-only items).
 
+    The duplicate algorithm does not need Telegram's often-long ``file_id``,
+    so it is intentionally omitted to keep a large scan compact in memory.
+
     Returns:
-        List of tuples: (id, content_type, file_id, file_size, file_name, file_unique_id)
+        List of tuples: (id, content_type, file_size, file_name, file_unique_id)
     """
     with db_transaction(commit=False) as (conn, cur):
+        # Filter unique rows in SQLite first.  On a normal collection this
+        # returns only a tiny subset, instead of building Python objects for
+        # every stored file just to discard them as non-duplicates.
         cur.execute(
             """
-            SELECT id, content_type, file_id, file_size, file_name, file_unique_id
-            FROM items
-            WHERE collection_id = ? AND file_id IS NOT NULL
-            ORDER BY id
+            WITH
+            forward_keys AS (
+                SELECT content_type, file_unique_id
+                FROM items
+                WHERE collection_id = ? AND file_id IS NOT NULL
+                  AND file_unique_id IS NOT NULL
+                GROUP BY content_type, file_unique_id
+                HAVING COUNT(*) > 1
+            ),
+            reupload_keys AS (
+                SELECT content_type, file_size, COALESCE(file_name, '') AS file_name
+                FROM items
+                WHERE collection_id = ? AND file_id IS NOT NULL
+                  AND file_size IS NOT NULL
+                GROUP BY content_type, file_size, COALESCE(file_name, '')
+                HAVING COUNT(*) > 1
+            )
+            SELECT DISTINCT i.id, i.content_type, i.file_size, i.file_name, i.file_unique_id
+            FROM items i
+            LEFT JOIN forward_keys f
+              ON f.content_type = i.content_type AND f.file_unique_id = i.file_unique_id
+            LEFT JOIN reupload_keys r
+              ON r.content_type = i.content_type AND r.file_size = i.file_size
+             AND r.file_name = COALESCE(i.file_name, '')
+            WHERE i.collection_id = ? AND i.file_id IS NOT NULL
+              AND (f.file_unique_id IS NOT NULL OR r.file_size IS NOT NULL)
+            ORDER BY i.id
             """,
-            (collection_id,)
+            (collection_id, collection_id, collection_id),
         )
         return cur.fetchall()
 
@@ -1090,4 +1168,61 @@ def get_collection_stats(collection_id: int) -> dict:
             stats["last_item_date"] = date_row[1]
 
         return stats
+
+
+def search_items(user_id: int, query_text: str, is_admin_user: bool = False) -> list:
+    """
+    Search items in collections that the user has access to.
+    If is_admin_user is True, searches all collections.
+    Returns:
+        List of tuples: (id, content_type, file_id, text_content, file_name, collection_name)
+    """
+    q = f"%{query_text}%"
+    with db_transaction(commit=False) as (conn, cur):
+        if is_admin_user:
+            cur.execute(
+                """
+                SELECT i.id, i.content_type, i.file_id, i.text_content, i.file_name, c.name
+                FROM items i
+                JOIN collections c ON i.collection_id = c.id
+                WHERE i.file_name LIKE ? OR i.text_content LIKE ?
+                ORDER BY i.id DESC
+                LIMIT 50
+                """,
+                (q, q)
+            )
+        else:
+            # Get allowed collections: owned + active shared
+            owned = get_collections(user_id)
+            allowed_cols = [col[0] for col in owned]
+            
+            # Check active shared collection
+            cur.execute("SELECT current_share_code FROM users WHERE user_id = ?", (user_id,))
+            user_row = cur.fetchone()
+            if user_row and user_row[0]:
+                share_code = user_row[0]
+                cur.execute("SELECT collection_id FROM shared_collections WHERE share_code = ? AND is_active = 1", (share_code,))
+                sc_row = cur.fetchone()
+                if sc_row:
+                    allowed_cols.append(sc_row[0])
+            
+            if not allowed_cols:
+                return []
+                
+            placeholders = ",".join("?" for _ in allowed_cols)
+            params = allowed_cols + [q, q]
+            cur.execute(
+                f"""
+                SELECT i.id, i.content_type, i.file_id, i.text_content, i.file_name, c.name
+                FROM items i
+                JOIN collections c ON i.collection_id = c.id
+                WHERE i.collection_id IN ({placeholders})
+                  AND (i.file_name LIKE ? OR i.text_content LIKE ?)
+                ORDER BY i.id DESC
+                LIMIT 50
+                """,
+                params
+            )
+        return cur.fetchall()
+
 

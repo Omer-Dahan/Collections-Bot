@@ -6,7 +6,7 @@ from constants import active_collections
 from utils import (
     record_activity, get_user_keyboard, get_main_menu_text, 
     build_main_menu_keyboard, send_response, show_collections_menu, 
-    get_stop_collect_keyboard, get_collect_mode_text,
+    get_stop_collect_keyboard, get_collect_mode_text, set_active_collection,
     logger
 )
 
@@ -125,7 +125,7 @@ async def new_collection_flow(message, user, context, args: list[str], edit_mess
     name = " ".join(args)
     try:
         collection_id = db.create_collection(name, user.id)
-        active_collections[user.id] = collection_id
+        set_active_collection(user.id, collection_id)
         
         await message.reply_text(
             get_collect_mode_text(name),

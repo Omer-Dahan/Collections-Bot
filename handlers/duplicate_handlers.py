@@ -1,11 +1,14 @@
 """
 Duplicate file scanner handlers for the Collections Bot.
 
-Scanning logic:
-- NEW items (with file_unique_id stored): compared by (content_type, file_unique_id).
-  This is the accurate path — Telegram guarantees file_unique_id is stable per file.
-- LEGACY items (file_unique_id is NULL, added before this feature):
-  compared by (content_type, file_size) as a best-effort fallback.
+Scanning logic — two independent passes:
+- Pass 1 (Forward duplicates): items with the same file_unique_id.
+  Catches files forwarded multiple times into the collection.
+  NOTE: re-uploading the same file gives a different file_unique_id,
+  so this pass alone is NOT sufficient.
+- Pass 2 (Re-upload duplicates): items with the same (content_type, file_size, file_name).
+  Catches the common case of the user adding the same file more than once.
+  Applied to ALL items, including those with a file_unique_id.
 
 Within each duplicate group the first item (lowest ID) is kept as the "original"
 and all subsequent items are marked as duplicates to be deleted.
@@ -31,52 +34,77 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
     """
     Detect duplicate groups from a flat list of item tuples.
 
-    Tuple format: (id, content_type, file_id, file_size, file_name, file_unique_id)
+    Tuple format: (id, content_type, file_size, file_name, file_unique_id)
 
-    Strategy (per item type):
-    - If file_unique_id is available → compare by (content_type, file_unique_id).
-      This is the reliable path: Telegram guarantees this ID is stable per file content.
-    - If file_unique_id is NULL (legacy items added before this feature) →
-      compare by (content_type, file_size) as a best-effort fallback.
-      Note: different files can theoretically share a size, so this may
-      produce occasional false positives, but it is the only option
-      without re-fetching metadata from Telegram.
+    Strategy — two independent passes, results are merged:
+
+    Pass 1 — Forward duplicates (file_unique_id):
+      Items that share the same file_unique_id are Telegram-forwarded copies of
+      the same upload. This catches cases where the user forwarded a message twice.
+      NOTE: re-uploading the same file gives a NEW file_unique_id each time, so
+      this pass will NOT catch re-uploads. That is why Pass 2 is needed.
+
+    Pass 2 — Re-upload duplicates (file_size + file_name):
+      Applied to ALL items (including those with a file_unique_id).
+      Two files are considered duplicates if they share the same content_type,
+      file_size, and file_name. This catches the most common case where a user
+      adds the same file from their gallery multiple times.
+      Risk of false positives is low when both size AND name match.
+      Items with no file_size are skipped (cannot be compared).
+      file_name is normalized to "" when NULL.
+
+    Groups from both passes are merged: if an item already belongs to a group
+    from Pass 1, it will not create a separate group in Pass 2.
 
     Returns:
         (groups, reliable_count, fallback_count)
-        - groups: list of duplicate groups (each group ≥ 2 items)
-        - reliable_count: items compared by file_unique_id
-        - fallback_count: items compared by file_size (legacy)
+        - groups: list of duplicate groups (each group >= 2 items)
+        - reliable_count: groups found via file_unique_id (Pass 1)
+        - fallback_count: groups found via file_size+name (Pass 2)
     """
-    reliable: dict[tuple, list] = {}   # key = (content_type, file_unique_id)
-    fallback: dict[tuple, list] = {}   # key = (content_type, file_size)
-    reliable_count = 0
-    fallback_count = 0
+    SCANNABLE = ("video", "photo", "document", "audio")
 
+    # --- Pass 1: Forward duplicates via file_unique_id ---
+    forward_map: dict[tuple, list] = {}
     for item in items:
-        item_id, content_type, file_id, file_size, file_name, file_unique_id = item
-
-        # Skip non-scannable types
-        if content_type not in ("video", "photo", "document", "audio"):
+        item_id, content_type, file_size, file_name, file_unique_id = item
+        if content_type not in SCANNABLE:
             continue
-
         if file_unique_id:
-            # Reliable path: consider file name as well to prevent false positives if user renamed identical files
-            key = (content_type, file_unique_id, file_name)
-            reliable.setdefault(key, []).append(item)
-            reliable_count += 1
-        elif file_size is not None:
-            # Fallback path for legacy items: include file name to prevent grouping split archives with identical sizes
-            key = (content_type, file_size, file_name)
-            fallback.setdefault(key, []).append(item)
-            fallback_count += 1
-        # else: no usable data — skip
+            key = (content_type, file_unique_id)
+            forward_map.setdefault(key, []).append(item)
 
-    # Collect only groups with ≥ 2 members
-    groups = (
-        [g for g in reliable.values() if len(g) > 1] +
-        [g for g in fallback.values() if len(g) > 1]
-    )
+    forward_groups = [g for g in forward_map.values() if len(g) > 1]
+    reliable_count = len(forward_groups)
+
+    # Track which item IDs are already covered by a forward group (avoid double-counting)
+    covered_ids: set[int] = {item[0] for group in forward_groups for item in group}
+
+    # --- Pass 2: Re-upload duplicates via (content_type, file_size, file_name) ---
+    reupload_map: dict[tuple, list] = {}
+    for item in items:
+        item_id, content_type, file_size, file_name, file_unique_id = item
+        if content_type not in SCANNABLE:
+            continue
+        if file_size is None:
+            continue  # no size data — cannot compare
+        normalized_name = file_name or ""
+        key = (content_type, file_size, normalized_name)
+        reupload_map.setdefault(key, []).append(item)
+
+    reupload_groups = []
+    for group in reupload_map.values():
+        if len(group) < 2:
+            continue
+        # Keep the group only if it contains items not already covered by Pass 1
+        has_new = any(item[0] not in covered_ids for item in group)
+        if has_new:
+            reupload_groups.append(group)
+            covered_ids.update(item[0] for item in group)
+
+    fallback_count = len(reupload_groups)
+
+    groups = forward_groups + reupload_groups
     return groups, reliable_count, fallback_count
 
 
@@ -228,6 +256,12 @@ async def handle_scan_duplicates_callback(
     if not is_allowed:
         return
 
+    # Replace a prior unfinished scan instead of retaining its potentially
+    # large groups in this user's in-memory session.
+    for key in (_GROUPS_KEY, _PENDING_DELETE_KEY, "duplicate_scan_col_id",
+                "dup_reliable_count", "dup_fallback_count"):
+        context.user_data.pop(key, None)
+
     # Fetch all scannable items
     items = db.get_all_items_for_duplicate_scan(col_id)
 
@@ -356,4 +390,3 @@ async def handle_confirm_delete_dupes_callback(
         "User %s deleted %d duplicate items from collection %d (%s)",
         query.from_user.id, deleted_count, col_id, col[1]
     )
-

@@ -2,17 +2,21 @@
 Handlers for processing incoming messages, including item addition and mode-based interactions.
 """
 import asyncio
+import time
 from io import BytesIO
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 import db
-from constants import active_collections, active_shared_collections
+from constants import (
+    active_collections, active_shared_collections,
+    active_shared_collection_timestamps,
+)
 from utils import (
     verify_user_code, update_batch_status,
     send_response, show_collection_page, logger,
     check_collection_access, extract_file_info,
     prepare_media_groups, send_media_groups_in_chunks,
-    get_stop_collect_keyboard, get_collect_mode_text
+    get_stop_collect_keyboard, get_collect_mode_text, set_active_collection,
 )
 from archive_logger import (
     archive_file_to_channels, log_activity, ENABLE_ARCHIVING
@@ -33,7 +37,7 @@ async def handle_new_collection_name_input(message, context: ContextTypes.DEFAUL
 
     try:
         collection_id = db.create_collection(name, user.id)
-        active_collections[user.id] = collection_id
+        set_active_collection(user.id, collection_id)
 
         if "creating_collection_mode" in context.user_data:
             del context.user_data["creating_collection_mode"]
@@ -159,7 +163,7 @@ async def process_imported_collection(message, context: ContextTypes.DEFAULT_TYP
 
         # Finish
         context.user_data.pop("import_mode", None)
-        active_collections[message.from_user.id] = col_id
+        set_active_collection(message.from_user.id, col_id)
 
         err_text = f"⚠️ שגיאות: {errors}\n" if errors > 0 else ""
         await status_msg.edit_text(
@@ -212,13 +216,21 @@ async def handle_send_collection_confirmation(
 
     status_msg = await message.reply_text(f"🚀 מאמת קוד... מתחיל שליחה של אוסף '{col[1]}'.")
 
-    # Start sending
-    items = db.get_items_by_collection(col_id, limit=10000)
-    visual, docs, texts = prepare_media_groups(items)
-
-    await send_media_groups_in_chunks(
-        context.bot, message.chat_id, visual, docs, texts, user_id=message.from_user.id
-    )
+    # Fetch and prepare a bounded page at a time.  A large collection no
+    # longer creates InputMedia objects for every item simultaneously.
+    offset = 0
+    page_size = 100
+    while True:
+        items = db.get_items_by_collection(col_id, offset=offset, limit=page_size)
+        if not items:
+            break
+        visual, docs, texts = prepare_media_groups(items)
+        await send_media_groups_in_chunks(
+            context.bot, message.chat_id, visual, docs, texts, user_id=message.from_user.id
+        )
+        offset += len(items)
+        if len(items) < page_size:
+            break
 
     # Cleanup temporary messages
     try:
@@ -306,6 +318,7 @@ async def activate_shared_collection(
 
     # Store access
     active_shared_collections[user.id] = share_code
+    active_shared_collection_timestamps[user.id] = time.time()
     db.set_user_active_share(user.id, share_code)
     db.log_share_access(share_code, user.id)
 
@@ -503,12 +516,20 @@ async def handle_id_request(message, context: ContextTypes.DEFAULT_TYPE) -> bool
             page = context.user_data.get("info_page_page", 1)
             info_page = context.user_data.get("info_page_info_page", 0)
 
-            back_button = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🔙 חזור לרשימת מידע",
-                    callback_data=f"back_to_info:{info_col_id}:{page}:{info_page}"
-                )]
-            ])
+            if context.user_data.get("from_search_results"):
+                back_button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔙 חזור לאוסף",
+                        callback_data=f"browse_page:{info_col_id}:1"
+                    )]
+                ])
+            else:
+                back_button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔙 חזור לרשימת מידע",
+                        callback_data=f"back_to_info:{info_col_id}:{page}:{info_page}"
+                    )]
+                ])
 
             content_type = item[2]
             file_id = item[3]
@@ -573,16 +594,15 @@ async def handle_item_addition(message, user, context: ContextTypes.DEFAULT_TYPE
             f_name, f_size, file_unique_id=file_unique_id
         )
         col_data = db.get_collection_by_id(collection_id)
+        set_active_collection(user.id, collection_id)
         col_name = col_data[1] if col_data else "Unknown"
 
         if ENABLE_ARCHIVING:
-            asyncio.create_task(
-                archive_file_to_channels(
-                    bot=context.bot, item_id=item_id, file_id=file_id,
-                    content_type=content_type, user_id=user.id, collection_id=collection_id,
-                    collection_name=col_name, file_name=f_name, original_caption=text_content,
-                    user_name=user.full_name, username=user.username
-                )
+            await archive_file_to_channels(
+                bot=context.bot, item_id=item_id, file_id=file_id,
+                content_type=content_type, user_id=user.id, collection_id=collection_id,
+                collection_name=col_name, file_name=f_name, original_caption=text_content,
+                user_name=user.full_name, username=user.username
             )
         await update_batch_status(message, context, col_name)
         return True
@@ -590,6 +610,94 @@ async def handle_item_addition(message, user, context: ContextTypes.DEFAULT_TYPE
         logger.error("Error adding item: %s", e)
         await message.reply_text("שגיאה בשמירת הפריט.")
         return True
+
+async def handle_search_query_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """קבלת מילת החיפוש מהמשתמש, ביצוע החיפוש והצגת התוצאות"""
+    message = update.message
+    query_text = message.text
+    if not query_text:
+        await message.reply_text("אנא שלח טקסט לחיפוש.")
+        return
+
+    query_text = query_text.strip()
+    user_id = message.from_user.id
+    col_id = context.user_data.pop("waiting_for_search_query", None)
+    search_msg_id = context.user_data.pop("search_from_message_id", None)
+    
+    # Try to delete the search prompt message to keep chat clean
+    if search_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=search_msg_id)
+        except Exception:
+            pass
+
+    from config import is_admin
+    # Search database
+    results = db.search_items(user_id, query_text, is_admin(user_id))
+
+    import html
+    if not results:
+        # Provide return button
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 חזור לאוסף", callback_data=f"browse_page:{col_id}:1")]
+        ])
+        await message.reply_text(
+            f"❌ לא נמצאו תוצאות עבור החיפוש: \"{html.escape(query_text)}\"",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        return
+
+    # Format results
+    content_type_map = {
+        "video": "🎬",
+        "photo": "🖼", 
+        "document": "📄",
+        "audio": "🎵",
+        "text": "📝"
+    }
+    content_type_names = {
+        "video": "סרטון",
+        "photo": "תמונה", 
+        "document": "קובץ",
+        "audio": "אודיו",
+        "text": "טקסט"
+    }
+
+    lines = [f"🔍 <b>תוצאות חיפוש עבור: \"{html.escape(query_text)}\"</b>\n"]
+    allowed_ids = []
+    
+    for item_id, content_type, file_id, text_content, file_name, col_name in results:
+        allowed_ids.append(item_id)
+        icon = content_type_map.get(content_type, "📁")
+        type_name = content_type_names.get(content_type, "קובץ")
+        display_name = file_name or (text_content[:40] + "..." if text_content and len(text_content) > 40 else text_content) or "(ללא שם/תיאור)"
+        
+        item_block = (
+            f"{icon}  <b>{html.escape(type_name)}</b>  |  {html.escape(display_name)}\n"
+            f"🆔  מזהה (ID): <code>{item_id}</code>\n"
+            f"📁  אוסף: {html.escape(col_name)}\n"
+            f"──────────────────"
+        )
+        lines.append(item_block)
+
+    lines.append("\n💡 <b>שלח/י את מספר ה-ID של הקובץ בהודעה כדי לקבל אותו.</b>")
+    
+    # Update allowed item ids in context.user_data
+    context.user_data["allowed_item_ids"] = allowed_ids
+    # Set info_page_collection_id to col_id so handle_id_request allows it
+    context.user_data["info_page_collection_id"] = col_id
+    # Set flag indicating that the user came from search results
+    context.user_data["from_search_results"] = True
+
+    response_text = "\n".join(lines)
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 חזור לאוסף", callback_data=f"browse_page:{col_id}:1")]
+    ])
+
+    await message.reply_text(response_text, reply_markup=keyboard, parse_mode="HTML")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main generic message handler for tracking input and matching modes."""
@@ -632,6 +740,9 @@ async def _evaluate_mode_flags(update: Update, context: ContextTypes.DEFAULT_TYP
     """Check and dispatch specialized modes."""
     msg = update.message
     data = context.user_data
+    if data.get("waiting_for_search_query"):
+        await handle_search_query_input(update, context)
+        return True
     if data.get("creating_collection_mode"):
         await handle_new_collection_name_input(msg, context)
         return True

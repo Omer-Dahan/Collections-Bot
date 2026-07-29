@@ -27,6 +27,7 @@ def build_admin_main_menu():
         [InlineKeyboardButton("📦 אוספים", callback_data="admin_collections")],
         [InlineKeyboardButton("🔗 שיתופים", callback_data="admin_shares")],
         [InlineKeyboardButton("📊 סטטיסטיקות", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔍 סריקת קבצים פגומים", callback_data="admin_scan_files")],
         [InlineKeyboardButton("🏠 מסך הבית", callback_data="back_to_main")]
     ]
     
@@ -111,6 +112,12 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         share_code = data.split(":")[1]
         await show_share_access_log(query, context, share_code)
     
+    # Scan files callbacks
+    elif data == "admin_scan_files":
+        await show_scan_files_menu(query, context)
+    elif data == "admin_scan_files_confirm":
+        await run_scan_files_inline(query, context)
+
     # Additional callbacks
     elif data == "admin_close":
         await query.delete_message()
@@ -690,6 +697,137 @@ async def delete_collection_action(query, context: ContextTypes.DEFAULT_TYPE, co
 
 # === File ID Scan ===
 
+
+async def show_scan_files_menu(query, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show the file scan confirmation screen from the admin menu.
+    Displays the number of items that will be scanned and asks for confirmation.
+    """
+    total = db.count_file_items()
+    DELAY = 0.05
+    est_seconds = int(total * (DELAY + 0.07))
+    if est_seconds < 60:
+        eta_str = f"~{est_seconds} שניות"
+    else:
+        eta_str = f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות"
+
+    text = (
+        "🔍 <b>סריקת קבצים פגומים</b>\n\n"
+        f"סה\"כ פריטים עם file_id: <b>{total:,}</b>\n"
+        f"זמן משוער: <b>{eta_str}</b>\n\n"
+        "הסריקה בודקת האם כל ה-file_ids \"במסד הנתונים\" עדיין תקינים \"בשרתי טלגרם\".\n"
+        "קבצים לא תקינים <b>לא יימחקו</b> — תקבל דוח בלבד.\n\n"
+        "⚠️ הסריקה עשויה לקחת זמן. הבוט ימשיך לעבוד תקין במהלכה."
+    )
+    keyboard = [
+        [InlineKeyboardButton("✅ התחל סריקה", callback_data="admin_scan_files_confirm")],
+        [InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")],
+    ]
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def run_scan_files_inline(query, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Run the file_id validity scan triggered from the admin inline menu.
+    Edits the same message to show live progress and a final report.
+    Unlike scan_file_ids (command-based), this works entirely through
+    callback_query.edit_message_text so it never needs update.message.
+    """
+    import asyncio as _asyncio
+
+    await query.answer("⏳ מתחיל סריקה...")
+
+    total = db.count_file_items()
+
+    if total == 0:
+        await query.edit_message_text(
+            "ℹ️ אין פריטים עם file_id לסריקה.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")]
+            ])
+        )
+        return
+
+    DELAY = 0.05
+    est_seconds = int(total * (DELAY + 0.07))
+    eta_str = f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות" if est_seconds >= 60 else f"~{est_seconds} שניות"
+
+    # Show initial progress message (no keyboard during scan — prevents double-click)
+    try:
+        await query.edit_message_text(
+            f"🔍 <b>סריקת file_ids — כל המאגר</b>\n"
+            f"סורק {total:,} פריטים | {eta_str}\n"
+            f"0 / {total:,}",
+            parse_mode="HTML"
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    invalid_count = 0
+    invalid_sample = []  # Keep only the rows shown in the final report.
+    type_breakdown: dict = {}
+    checked = 0
+    UPDATE_EVERY = max(10, total // 20)  # update ~20 times total
+
+    offset = 0
+    page_size = 100
+    while checked < total:
+        page = db.get_file_items_page(offset, min(page_size, total - checked))
+        if not page:
+            break
+        for item_id, c_type, fid in page:
+            is_valid = await _check_file_id(context.bot, fid, c_type)
+            if not is_valid:
+                invalid_count += 1
+                type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
+                if len(invalid_sample) < 20:
+                    invalid_sample.append((item_id, c_type))
+            checked += 1
+            await _asyncio.sleep(DELAY)
+
+            if checked % UPDATE_EVERY == 0 or checked == total:
+                pct = int(checked / total * 100)
+                try:
+                    await query.edit_message_text(
+                        f"🔍 <b>סריקת file_ids — כל המאגר</b>\n"
+                        f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
+                        f"❌ לא תקינים עד כה: {invalid_count}",
+                        parse_mode="HTML"
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass  # Ignore "message not modified" or flood-control errors
+        offset += len(page)
+
+    # Build final report
+    valid_count = total - invalid_count
+
+    breakdown_lines = "\n".join(
+        f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
+    ) or "  —"
+
+    report = (
+        f"📋 <b>דוח סריקת file_ids</b>\n"
+        f"היקף: כל המאגר\n\n"
+        f"📦 נסרקו: {total:,}\n"
+        f"✅ תקינים: {valid_count:,}\n"
+        f"❌ לא תקינים: {invalid_count}\n\n"
+        f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
+    )
+
+    if invalid_sample:
+        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct in invalid_sample)
+        report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
+        if invalid_count > 20:
+            report += f"\n  ... ועוד {invalid_count - 20} נוספים"
+
+    keyboard = [[InlineKeyboardButton("⬅️ חזור לתפריט", callback_data="admin_back_to_main")]]
+    try:
+        await query.edit_message_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:  # pylint: disable=broad-exception-caught
+        # If message is too long, send a trimmed version
+        trimmed = report[:3800] + "\n\n⚠️ הדוח קוצר עקב מגבלת אורך הודעה."
+        await query.edit_message_text(trimmed, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
 # Error substrings that confirm a file_id is truly invalid (not a network hiccup)
 _INVALID_FILE_ERRORS = (
     "wrong file_id",
@@ -770,27 +908,21 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ limit חייב להיות מספר שלם חיובי.")
                 return
 
-    # ── Fetch items ───────────────────────────────────────────────────
+    # ── Validate scope without loading all file IDs ────────────────────
     if target_col_id is not None:
         col = db.get_collection_by_id(target_col_id)
         if not col:
             await update.message.reply_text(f"❌ אוסף {target_col_id} לא נמצא.")
             return
-        raw = db.get_items_by_collection(target_col_id, limit=100_000)
-        # get_items_by_collection returns: (id, content_type, file_id, ...)
-        all_items = [(r[0], r[1], r[2]) for r in raw if r[2]]
         scope_label = f"אוסף #{target_col_id} ({col[1]})"
     else:
-        all_items = db.get_all_file_items()   # returns (id, content_type, file_id)
         scope_label = "כל המאגר"
 
+    available = db.count_file_items(target_col_id)
+    total = min(available, item_limit) if item_limit else available
     if item_limit:
-        file_items = all_items[:item_limit]
         scope_label += f" (ראשונים {item_limit})"
-    else:
-        file_items = all_items
 
-    total = len(file_items)
     if total == 0:
         await update.message.reply_text("אין פריטים עם file_id לסריקה.")
         return
@@ -823,36 +955,43 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ── Scan loop ─────────────────────────────────────────────────────
-    invalid_ids = []  # list of (item_id, content_type, file_id)
+    invalid_count = 0
+    invalid_sample = []  # Keep only what the final report displays.
+    type_breakdown: dict = {}
     checked = 0
     UPDATE_EVERY = max(10, total // 20)  # update ~20 times during scan
 
-    for item_id, c_type, fid in file_items:
-        is_valid = await _check_file_id(context.bot, fid, c_type)
-        if not is_valid:
-            invalid_ids.append((item_id, c_type, fid))
-        checked += 1
-        await _asyncio.sleep(DELAY)
+    offset = 0
+    page_size = 100
+    while checked < total:
+        page = db.get_file_items_page(offset, min(page_size, total - checked), target_col_id)
+        if not page:
+            break
+        for item_id, c_type, fid in page:
+            is_valid = await _check_file_id(context.bot, fid, c_type)
+            if not is_valid:
+                invalid_count += 1
+                type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
+                if len(invalid_sample) < 20:
+                    invalid_sample.append((item_id, c_type))
+            checked += 1
+            await _asyncio.sleep(DELAY)
 
-        if checked % UPDATE_EVERY == 0 or checked == total:
-            pct = int(checked / total * 100)
-            try:
-                await status_msg.edit_text(
-                    f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
-                    f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
-                    f"❌ לא תקינים עד כה: {len(invalid_ids)}",
-                    parse_mode="HTML"
-                )
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
+            if checked % UPDATE_EVERY == 0 or checked == total:
+                pct = int(checked / total * 100)
+                try:
+                    await status_msg.edit_text(
+                        f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
+                        f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
+                        f"❌ לא תקינים עד כה: {invalid_count}",
+                        parse_mode="HTML"
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+        offset += len(page)
 
     # ── Build final report ────────────────────────────────────────────
-    invalid_count = len(invalid_ids)
     valid_count = total - invalid_count
-
-    type_breakdown: dict = {}
-    for _, c_type, _ in invalid_ids:
-        type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
 
     breakdown_lines = "\n".join(
         f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
@@ -867,9 +1006,8 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
     )
 
-    if invalid_ids:
-        sample = invalid_ids[:20]
-        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct, _ in sample)
+    if invalid_sample:
+        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct in invalid_sample)
         report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
         if invalid_count > 20:
             report += f"\n  ... ועוד {invalid_count - 20} נוספים"

@@ -4,6 +4,7 @@ Configures logging, restores sessions, and sets up the Telegram application.
 """
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import os
 import time
@@ -25,14 +26,17 @@ from telegram.request import HTTPXRequest
 import db
 from config import BOT_TOKEN
 from admin_panel import admin_panel, handle_admin_callback, scan_file_ids
-from utils import error_handler, UserActionFilter, logger
-from constants import active_shared_collections
+from utils import error_handler, UserActionFilter, logger, touch_user_activity
+from constants import (
+    active_collections, active_collection_timestamps,
+    active_shared_collections, active_shared_collection_timestamps,
+)
 from handlers import (
     start, new_collection, list_collections, manage_collections, browse,
     remove, id_file, access_shared,
     handle_select_collection_callback, handle_browse_page_callback,
     handle_scroll_view_callback, handle_page_info_callback,
-    handle_back_to_info_callback,
+    handle_back_to_info_callback, handle_search_collection_callback,
     handle_browse_group_or_select_all_callback, handle_page_file_send_choice_callback,
     handle_batch_status_callback, handle_collection_send_all_callback,
     handle_stop_collect_callback,
@@ -83,7 +87,9 @@ def _kill_old_instance():
 def setup_logging():
     """Configure bot logging with file and console handlers."""
     # File handler - only user actions and errors
-    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setLevel(logging.INFO)
     format_str = "%(asctime)s [%(levelname)s]: %(message)s"
     file_handler.setFormatter(logging.Formatter(format_str))
@@ -116,26 +122,30 @@ async def check_expired_shares_job(context: ContextTypes.DEFAULT_TYPE):
         for share_code, _, _, _ in expired_shares:
             try:
                 db.deactivate_share_by_code(share_code)
-                messages = db.get_messages_for_share(share_code)
                 deleted_count = 0
-
-                for _, chat_id, message_id in messages:
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                        deleted_count += 1
-                        await asyncio.sleep(0.05)
-                    except Exception as e: # pylint: disable=broad-exception-caught
-                        error_str = str(e).lower()
-                        if "400" in str(e) or "not found" in error_str or "deleted" in error_str:
+                processed_count = 0
+                while True:
+                    messages = db.get_messages_for_share(share_code, limit=100)
+                    if not messages:
+                        break
+                    for _, chat_id, message_id in messages:
+                        processed_count += 1
+                        try:
+                            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
                             deleted_count += 1
-                        else:
-                            logger.warning("Failed to delete message %s: %s", message_id, e)
-                    finally:
-                        db.delete_single_message_record(message_id, chat_id)
+                            await asyncio.sleep(0.05)
+                        except Exception as e: # pylint: disable=broad-exception-caught
+                            error_str = str(e).lower()
+                            if "400" in str(e) or "not found" in error_str or "deleted" in error_str:
+                                deleted_count += 1
+                            else:
+                                logger.warning("Failed to delete message %s: %s", message_id, e)
+                        finally:
+                            db.delete_single_message_record(message_id, chat_id)
 
                 logger.info(
                     "Expired share %s...: deleted %d/%d messages",
-                    share_code[:8], deleted_count, len(messages)
+                    share_code[:8], deleted_count, processed_count
                 )
             except Exception as e: # pylint: disable=broad-exception-caught
                 logger.error("Error processing expired share %s: %s", share_code, e)
@@ -146,6 +156,10 @@ async def track_user_messages(update: Update, _context: ContextTypes.DEFAULT_TYP
     """Global handler to track ALL user messages during shared sessions."""
     user = update.effective_user
     message = update.effective_message
+    if user:
+        touch_user_activity(_context)
+        if user.id in active_shared_collection_timestamps:
+            active_shared_collection_timestamps[user.id] = time.time()
     if user and message:
         share_code = active_shared_collections.get(user.id)
         if share_code:
@@ -153,6 +167,45 @@ async def track_user_messages(update: Update, _context: ContextTypes.DEFAULT_TYP
                 db.log_shared_message(share_code, user.id, message.chat_id, message.message_id)
             except Exception: # pylint: disable=broad-exception-caught
                 pass
+
+
+async def track_callback_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Refresh user-data TTL for callback-only interactions as well."""
+    if update.effective_user:
+        touch_user_activity(context)
+        user_id = update.effective_user.id
+        if user_id in active_shared_collection_timestamps:
+            active_shared_collection_timestamps[user_id] = time.time()
+
+
+async def cleanup_memory_job(context: ContextTypes.DEFAULT_TYPE):
+    """Bound inactive in-process state and prune old database bookkeeping."""
+    now = time.time()
+    session_ttl = 60 * 60
+    user_data_ttl = 60 * 60
+
+    for user_id, last_seen in list(active_collection_timestamps.items()):
+        if now - last_seen > session_ttl:
+            active_collection_timestamps.pop(user_id, None)
+            active_collections.pop(user_id, None)
+
+    for user_id, last_seen in list(active_shared_collection_timestamps.items()):
+        if now - last_seen > session_ttl:
+            active_shared_collection_timestamps.pop(user_id, None)
+            active_shared_collections.pop(user_id, None)
+            db.set_user_active_share(user_id, None)
+
+    for user_id, data in list(context.application.user_data.items()):
+        last_seen = data.get("_last_activity_at", 0)
+        if now - last_seen > user_data_ttl:
+            context.application.drop_user_data(user_id)
+
+
+async def cleanup_share_data_job(context: ContextTypes.DEFAULT_TYPE):
+    """Keep historical share tables from growing indefinitely on disk/RAM reads."""
+    messages, logs = db.purge_old_share_data()
+    if messages or logs:
+        logger.info("Purged %d stale shared-message rows and %d old access logs", messages, logs)
 
 async def post_init(application):
     """Set up bot commands menu after bot is initialized."""
@@ -193,6 +246,7 @@ def _register_handlers(app):
     ))
     app.add_handler(CallbackQueryHandler(handle_stop_collect_callback, pattern="^stop_collect$"))
     app.add_handler(CallbackQueryHandler(handle_browse_page_callback, pattern="^browse_page:"))
+    app.add_handler(CallbackQueryHandler(handle_search_collection_callback, pattern="^search_collection:"))
     app.add_handler(CallbackQueryHandler(handle_scroll_view_callback, pattern="^scroll_view:"))
     app.add_handler(CallbackQueryHandler(handle_page_info_callback, pattern="^page_info:"))
     app.add_handler(CallbackQueryHandler(handle_back_to_info_callback, pattern="^back_to_info:"))
@@ -271,6 +325,7 @@ def _register_handlers(app):
 
     # Messages
     app.add_handler(MessageHandler(filters.ALL, track_user_messages), group=-1)
+    app.add_handler(CallbackQueryHandler(track_callback_activity), group=-2)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
 def main():
@@ -285,25 +340,26 @@ def main():
     setup_logging()
     db.init_db()
 
-    # Restore sessions
-    try:
-        loaded_shares = db.get_users_with_active_shares()
-        active_shared_collections.update(loaded_shares)
-        logger.info("Restored %d active shared sessions from DB", len(loaded_shares))
-    except Exception as e: # pylint: disable=broad-exception-caught
-        logger.error("Failed to restore active sessions: %s", e)
+    # Shared-access sessions are intentionally not restored.  Restoring every
+    # historic session turns this dict into unbounded process memory; users can
+    # re-enter a valid share code after a restart.
 
     logger.info("Bot starting...")
 
     req = HTTPXRequest(connection_pool_size=8, read_timeout=60.0, write_timeout=60.0)
     # max_retries=3: retry up to 3 times on 429 flood control instead of crashing immediately
-    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter(max_retries=3)).request(req) \
-        .post_init(post_init).build()
+    # A bounded incoming-update queue prevents a network burst from becoming
+    # an unbounded in-process backlog on a small server. Polling pauses until
+    # the bot catches up, leaving excess updates safely with Telegram.
+    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter(max_retries=3)) \
+        .request(req).update_queue(asyncio.Queue(maxsize=100)).post_init(post_init).build()
 
     _register_handlers(app)
 
     if app.job_queue:
         app.job_queue.run_repeating(check_expired_shares_job, interval=60, first=10)
+        app.job_queue.run_repeating(cleanup_memory_job, interval=600, first=600)
+        app.job_queue.run_repeating(cleanup_share_data_job, interval=86400, first=3600)
         logger.info("Share expiration cleanup job scheduled")
 
     logger.info("Polling...")

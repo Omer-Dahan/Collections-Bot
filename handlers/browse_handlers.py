@@ -374,3 +374,40 @@ async def handle_batch_status_callback(update: Update, context: ContextTypes.DEF
         await query.answer(f"עד כה נוספו {count} קבצים בסשן הנוכחי", show_alert=True)
     except Exception: # pylint: disable=broad-exception-caught
         await query.answer()
+
+
+async def handle_search_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """בלחיצה על כפתור החיפוש באוסף, נבקש מהמשתמש להזין מילת חיפוש ונכניס אותו למצב המתנה"""
+    query = update.callback_query
+    await query.answer()
+
+    parts = parse_callback_data(query.data, "search_collection")
+    if not parts:
+        return
+
+    try:
+        col_id = int(parts[0])
+    except (ValueError, IndexError):
+        return
+
+    is_allowed, _, _ = check_collection_access(query.from_user.id, col_id)
+    if not is_allowed:
+        return
+
+    # Set waiting state
+    context.user_data["waiting_for_search_query"] = col_id
+    context.user_data["search_from_message_id"] = query.message.message_id
+
+    # Prompt user
+    prompt_text = (
+        "🔍 חיפוש במאגר\n\n"
+        "אנא שלח/י את מילת החיפוש (שם קובץ או חלק מטקסט) כהודעת טקסט.\n"
+        "החיפוש יתבצע בכל האוספים שיש לך גישה אליהם."
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ ביטול", callback_data=f"browse_page:{col_id}:1")]
+    ])
+
+    await query.edit_message_text(prompt_text, reply_markup=keyboard)
+

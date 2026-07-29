@@ -14,7 +14,6 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Literal
-from collections import deque
 from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import TelegramError, Forbidden, RetryAfter
 
@@ -31,8 +30,10 @@ RETRY_EXTRA_DELAY = 5.0   # extra delay after a RetryAfter error
 logger = logging.getLogger(__name__)
 
 
-# Global queue and lock for serializing archive operations
-_archive_queue: deque = deque()
+# A bounded queue prevents activity logging from retaining every uploaded file
+# in RAM when Telegram is slower than incoming uploads.
+ARCHIVE_QUEUE_MAXSIZE = 200
+_archive_queue: asyncio.Queue = asyncio.Queue(maxsize=ARCHIVE_QUEUE_MAXSIZE)
 _archive_lock = asyncio.Lock()
 _queue_processor_running = False
 
@@ -312,10 +313,11 @@ async def archive_file_to_channels(
     if not ENABLE_ARCHIVING:
         return True
     
-    # Use lock to prevent race condition when checking/setting processor status
+    # Enqueue before starting the worker, while holding the lock, so a worker
+    # can never observe an empty queue and exit between these two operations.
+    # ``put`` deliberately applies backpressure when the queue is full.
     async with _archive_lock:
-        # Add to queue
-        _archive_queue.append({
+        await _archive_queue.put({
             "item_id": item_id,
             "file_id": file_id,
             "content_type": content_type,
@@ -329,7 +331,8 @@ async def archive_file_to_channels(
             "bot": bot  # Store bot reference for queue processor
         })
         
-        # Start queue processor if not already running
+        # Start one worker only.  It stays alive while the application runs,
+        # which also avoids creating a new task for every uploaded file.
         if not _queue_processor_running:
             _queue_processor_running = True
             asyncio.create_task(_process_archive_queue_safe())
@@ -345,22 +348,14 @@ async def _process_archive_queue_safe():
     
     try:
         while True:
-            # Get next item under lock
-            async with _archive_lock:
-                if not _archive_queue:
-                    _queue_processor_running = False
-                    return
-                item = _archive_queue.popleft()
-            
+            item = await _archive_queue.get()
             bot = item.pop("bot")  # Extract bot from item
-            
             try:
                 await _do_archive_file(bot=bot, **item)
             except Exception as e:
                 logger.error(f"Error processing archive queue item: {e}")
-            
-            # Minimal delay between queue items
-            await asyncio.sleep(ACTIVITY_LOG_DELAY)
+            finally:
+                _archive_queue.task_done()
     except Exception as e:
         logger.error(f"Queue processor crashed: {e}")
     finally:

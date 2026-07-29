@@ -7,6 +7,7 @@ import math
 import asyncio
 import random
 import functools
+import time
 
 from telegram import (
     Update,
@@ -21,11 +22,25 @@ from telegram import (
 from telegram.ext import ContextTypes
 from telegram.error import NetworkError, RetryAfter
 import db
-from constants import MSG_NO_COLLECTIONS, active_collections, active_shared_collections
+from constants import (
+    MSG_NO_COLLECTIONS, active_collections, active_collection_timestamps,
+    active_shared_collections, active_shared_collection_timestamps,
+)
 from config import is_admin
 from message_tracker import track_if_shared
 
 logger = logging.getLogger(__name__)
+
+
+def set_active_collection(user_id: int, collection_id: int) -> None:
+    """Start or refresh an expirable collection mode for a user."""
+    active_collections[user_id] = collection_id
+    active_collection_timestamps[user_id] = time.time()
+
+
+def touch_user_activity(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark user data as active so the periodic cleanup can safely evict it."""
+    context.user_data["_last_activity_at"] = time.time()
 
 # Custom filter - only user action logs and errors
 class UserActionFilter(logging.Filter):
@@ -268,15 +283,26 @@ def reset_user_modes(context: ContextTypes.DEFAULT_TYPE, user_id: int = None):
     for key in ["delete_mode", "id_mode", "waiting_for_share_code", 
                 "verify_delete_collection", "verify_send_collection",
                 "import_mode", "creating_collection_mode", "temp_collection_name", "allowed_item_ids", "info_page_collection_id",
-                "item_delete_mode", "delete_target_collection_id"]:
+                "info_page_page", "info_page_info_page", "info_message_id",
+                "from_search_results", "waiting_for_search_query", "search_from_message_id",
+                "item_delete_mode", "delete_target_collection_id", "batch_status",
+                "pending_duplicate_ids", "duplicate_groups_cache", "duplicate_scan_col_id",
+                "dup_reliable_count", "dup_fallback_count"]:
         context.user_data.pop(key, None)
+
+    # The scope key contains a list of item IDs and is created dynamically.
+    for key in list(context.user_data):
+        if key.startswith("send_scope_"):
+            context.user_data.pop(key, None)
 
     # 2. If user_id provided, clear the global active collections/shared sessions
     if user_id:
         if user_id in active_collections:
             del active_collections[user_id]
+        active_collection_timestamps.pop(user_id, None)
         if user_id in active_shared_collections:
             del active_shared_collections[user_id]
+        active_shared_collection_timestamps.pop(user_id, None)
         
         # Also clear DB persistence for shared sessions
         db.set_user_active_share(user_id, None)
@@ -696,8 +722,12 @@ def build_page_menu(
 ) -> InlineKeyboardMarkup:
     """Browsing menu: Select All and below numbers representing groups of items"""
 
-    # First row: Select All
+    # First row: Search + Select All
     row_select_all = [
+        InlineKeyboardButton(
+            "🔍",
+            callback_data=f"search_collection:{collection_id}",
+        ),
         InlineKeyboardButton(
             "✳ בחר הכל",
             callback_data=f"browse_page_select_all:{collection_id}:{page}",
@@ -820,6 +850,9 @@ async def show_collection_page(
         message_id of the sent/edited message, or 0 on error
     """
     from message_tracker import track_if_shared
+    
+    # Clear search results flag when browsing
+    context.user_data.pop("from_search_results", None)
     
     effective_user_id = user_id or update.effective_user.id
     chat_id = update.effective_chat.id

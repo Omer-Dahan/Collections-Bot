@@ -30,7 +30,8 @@ from .browse_handlers import (
     handle_browse_page_callback, handle_scroll_view_callback,
     handle_page_info_callback, handle_back_to_info_callback,
     handle_browse_group_or_select_all_callback, handle_page_file_send_choice_callback,
-    handle_batch_status_callback, handle_random_video_scroll_callback
+    handle_batch_status_callback, handle_random_video_scroll_callback,
+    handle_search_collection_callback
 )
 from .messages import (
     handle_message, handle_new_collection_name_input,
@@ -46,6 +47,7 @@ __all__ = [
     # Callbacks
     "handle_select_collection_callback", "handle_browse_page_callback",
     "handle_scroll_view_callback", "handle_page_info_callback",
+    "handle_search_collection_callback",
     "handle_browse_group_or_select_all_callback", "handle_page_file_send_choice_callback",
     "handle_batch_status_callback", "handle_collection_send_all_callback",
     "handle_stop_collect_callback", "handle_random_video_scroll_callback",
