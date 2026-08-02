@@ -26,6 +26,12 @@ from .duplicate_handlers import (
     handle_confirm_delete_dupes_callback,
     handle_dupes_page_callback
 )
+from .invalid_items_scan import (
+    start_invalid_scan_callback,
+    handle_invalid_scan_control_callback,
+    handle_invalid_scan_delete_callback,
+    cleanup_invalid_scans
+)
 from .browse_handlers import (
     handle_browse_page_callback, handle_scroll_view_callback,
     handle_page_info_callback, handle_back_to_info_callback,
@@ -64,6 +70,8 @@ __all__ = [
     "handle_collection_info_callback",
     "handle_scan_duplicates_callback", "handle_confirm_delete_dupes_callback",
     "handle_dupes_page_callback",
+    "start_invalid_scan_callback", "handle_invalid_scan_control_callback",
+    "handle_invalid_scan_delete_callback", "cleanup_invalid_scans",
 
     # Messages
     "handle_message", "handle_new_collection_name_input"

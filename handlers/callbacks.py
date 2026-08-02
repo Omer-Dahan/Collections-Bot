@@ -286,6 +286,9 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
                 "🔎 סריקת קבצים כפולים", callback_data=f"scan_duplicates:{col_id}"
             )],
             [InlineKeyboardButton(
+                "🔍 סריקת קבצים פגומים", callback_data=f"scan_invalid:{col_id}"
+            )],
+            [InlineKeyboardButton(
                 "🗑 מחיקת אוסף", callback_data=f"delete_collection:{col_id}"
             )],
             [InlineKeyboardButton("🔙 חזור לרשימה", callback_data="back_to_manage")],
@@ -297,6 +300,9 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
             )],
             [InlineKeyboardButton(
                 "📂 צפייה בתוכן (Admin)", callback_data=f"browse_page:{col_id}:1"
+            )],
+            [InlineKeyboardButton(
+                "🔍 סריקת קבצים פגומים", callback_data=f"scan_invalid:{col_id}"
             )],
             [InlineKeyboardButton(
                 "🗑 מחיקת אוסף (Admin)", callback_data=f"delete_collection:{col_id}"

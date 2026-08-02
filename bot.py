@@ -54,6 +54,8 @@ from handlers import (
     handle_dupes_page_callback,
     handle_random_video_scroll_callback,
     handle_collection_info_callback,
+    start_invalid_scan_callback, handle_invalid_scan_control_callback,
+    handle_invalid_scan_delete_callback, cleanup_invalid_scans,
     handle_message
 )
 
@@ -200,6 +202,8 @@ async def cleanup_memory_job(context: ContextTypes.DEFAULT_TYPE):
         if now - last_seen > user_data_ttl:
             context.application.drop_user_data(user_id)
 
+    cleanup_invalid_scans(context)
+
 
 async def cleanup_share_data_job(context: ContextTypes.DEFAULT_TYPE):
     """Keep historical share tables from growing indefinitely on disk/RAM reads."""
@@ -321,6 +325,16 @@ def _register_handlers(app):
     ))
     app.add_handler(CallbackQueryHandler(
         handle_random_video_scroll_callback, pattern="^random_video:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_invalid_scan_delete_callback, pattern="^scan_invalid_delete:"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_invalid_scan_control_callback,
+        pattern="^scan_invalid_(pause|resume|cancel):"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        start_invalid_scan_callback, pattern=r"^scan_invalid:\d"
     ))
 
     # Messages

@@ -828,41 +828,8 @@ async def run_scan_files_inline(query, context: ContextTypes.DEFAULT_TYPE):
         trimmed = report[:3800] + "\n\n⚠️ הדוח קוצר עקב מגבלת אורך הודעה."
         await query.edit_message_text(trimmed, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Error substrings that confirm a file_id is truly invalid (not a network hiccup)
-_INVALID_FILE_ERRORS = (
-    "wrong file_id",
-    "file_id_invalid",
-    "media_file_invalid",
-    "bad request: wrong",
-    "invalid file_id",
-    "file not found",
-)
+from utils import check_file_id as _check_file_id
 
-def _is_invalid_file_error(err: str) -> bool:
-    """Return True only when the error clearly means the file_id is broken."""
-    low = err.lower()
-    return any(kw in low for kw in _INVALID_FILE_ERRORS)
-
-
-async def _check_file_id(bot, fid: str, c_type: str) -> bool:
-    """
-    Return True if the file_id is still usable by this bot.
-    Uses get_file() which works for all types, but gracefully handles
-    the 20-MB limit: a FileTooLarge response means the id IS valid.
-    """
-    try:
-        await bot.get_file(fid)
-        return True  # success
-    except Exception as e:
-        err = str(e)
-        # "file is too big" / "FileTooLarge" → file exists, just too big to download
-        if "too big" in err.lower() or "file_too_big" in err.lower():
-            return True
-        # Definitively invalid
-        if _is_invalid_file_error(err):
-            return False
-        # Unknown error (network, timeout) → assume valid, don't count as broken
-        return True
 
 
 async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):

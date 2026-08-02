@@ -1051,3 +1051,40 @@ async def send_info_page(
     # Save the message ID for later deletion
     context.user_data["info_message_id"] = msg_id
     return msg_id
+
+
+_INVALID_FILE_ERRORS = (
+    "wrong file_id",
+    "file_id_invalid",
+    "media_file_invalid",
+    "bad request: wrong",
+    "invalid file_id",
+    "file not found",
+)
+
+
+def is_invalid_file_error(err: str) -> bool:
+    """Return True only when the error clearly means the file_id is broken."""
+    low = err.lower()
+    return any(kw in low for kw in _INVALID_FILE_ERRORS)
+
+
+async def check_file_id(bot, fid: str, c_type: str) -> bool:
+    """
+    Return True if the file_id is still usable by this bot.
+    Uses get_file() which works for all types, but gracefully handles
+    the 20-MB limit: a FileTooLarge response means the id IS valid.
+    """
+    try:
+        await bot.get_file(fid)
+        return True  # success
+    except Exception as e:
+        err = str(e)
+        # "file is too big" / "FileTooLarge" → file exists, just too big to download
+        if "too big" in err.lower() or "file_too_big" in err.lower():
+            return True
+        # Definitively invalid
+        if is_invalid_file_error(err):
+            return False
+        # Unknown error (network, timeout) → assume valid, don't count as broken
+        return True

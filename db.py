@@ -1072,7 +1072,7 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
 
 def delete_items_by_ids(item_ids: list[int]) -> int:
     """
-    Delete multiple items by their IDs in a single transaction.
+    Delete multiple items by their IDs in batched transactions to avoid SQLite limits.
 
     Args:
         item_ids: List of item IDs to delete
@@ -1082,13 +1082,20 @@ def delete_items_by_ids(item_ids: list[int]) -> int:
     """
     if not item_ids:
         return 0
-    placeholders = ",".join("?" * len(item_ids))
+
+    total_deleted = 0
+    batch_size = 500
     with db_transaction() as (conn, cur):
-        cur.execute(
-            f"DELETE FROM items WHERE id IN ({placeholders})",
-            item_ids
-        )
-        return cur.rowcount
+        for i in range(0, len(item_ids), batch_size):
+            chunk = item_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(chunk))
+            cur.execute(
+                f"DELETE FROM items WHERE id IN ({placeholders})",
+                chunk
+            )
+            total_deleted += cur.rowcount
+    return total_deleted
+
 
 
 def get_collection_stats(collection_id: int) -> dict:
