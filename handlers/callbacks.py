@@ -3,7 +3,7 @@ Callback handlers for the Collections Bot.
 This module contains general callbacks for collection management and sharing.
 Browsing-related callbacks have been moved to browse_handlers.py.
 """
-import asyncio
+import html
 import tempfile
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -19,7 +19,9 @@ from utils import (
     create_verification_code,
     get_main_menu_text, build_main_menu_keyboard,
     parse_callback_data,
-    parse_and_validate_access
+    parse_and_validate_access,
+    parse_and_validate_owner,
+    logger
 )
 from handlers.commands import (
     new_collection_flow, list_collections_flow, manage_collections_flow,
@@ -34,7 +36,7 @@ async def handle_select_collection_callback(update: Update, context: ContextType
     await query.answer()
 
     parts = parse_callback_data(query.data, "select_collection")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -46,9 +48,12 @@ async def handle_select_collection_callback(update: Update, context: ContextType
     )
 
     await query.edit_message_text(
-        text=f"✅ האוסף '**{col[1]}**' הוגדר כפעיל.\nכל קובץ שתשלח מעכשיו יתווסף אליו.",
+        text=(
+            f"✅ האוסף '<b>{html.escape(col[1])}</b>' הוגדר כפעיל.\n"
+            "כל קובץ שתשלח מעכשיו יתווסף אליו."
+        ),
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def handle_select_item_delete_col_callback(
@@ -59,7 +64,7 @@ async def handle_select_item_delete_col_callback(
     await query.answer()
 
     parts = parse_callback_data(query.data, "select_item_del_col")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -71,18 +76,17 @@ async def handle_select_item_delete_col_callback(
     ])
 
     text = (
-        f"🗑 **מצב מחיקת פריטים הופעל עבור: {col[1]}**\n\n"
+        f"🗑 <b>מצב מחיקת פריטים הופעל עבור: {html.escape(col[1])}</b>\n\n"
         "שלח לי כעת תמונה, וידאו או קובץ שקיים באוסף זה, ואני אמחק אותו עבורך.\n"
         "תוכל למחוק מספר פריטים ברצף."
     )
 
-    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def handle_collection_send_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request confirmation with verification code before sending all items in a collection."""
     query = update.callback_query
-    await query.answer()
 
     parts = parse_callback_data(query.data, "collection_send_all")
     is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
@@ -94,6 +98,8 @@ async def handle_collection_send_all_callback(update: Update, context: ContextTy
         await query.answer("האוסף ריק", show_alert=True)
         return
 
+    await query.answer()
+
     code = create_verification_code(
         context,
         "send_collection",
@@ -104,11 +110,11 @@ async def handle_collection_send_all_callback(update: Update, context: ContextTy
     )
 
     text = (
-        f"⚠️ **אישור שליחת אוסף מלא**\n\n"
-        f"אתה עומד לשלוח את כל האוסף: {col[1]} ({total_items} פריטים).\n"
+        f"⚠️ <b>אישור שליחת אוסף מלא</b>\n\n"
+        f"אתה עומד לשלוח את כל האוסף: {html.escape(col[1])} ({total_items} פריטים).\n"
         f"זה עשוי לקחת זמן וליצור עומס.\n\n"
         f"כדי לאשר, שלח את הקוד הבא לבוט:\n"
-        f"`{code}`"
+        f"<code>{html.escape(str(code))}</code>"
     )
 
     # We set a state to expect text input
@@ -116,7 +122,7 @@ async def handle_collection_send_all_callback(update: Update, context: ContextTy
 
     await query.edit_message_text(
         text=text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ ביטול", callback_data=f"browse_page:{col_id}:1")]
         ])
@@ -149,7 +155,7 @@ async def handle_delete_select_collection_callback(
 
     data = query.data
     parts = parse_callback_data(data, "delete_collection")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -162,18 +168,18 @@ async def handle_delete_select_collection_callback(
     item_count = db.count_items_in_collection(col_id)
 
     text = (
-        f"⚠️ **בטוח שאתה רוצה למחוק את האוסף?**\n\n"
-        f"📌 שם האוסף: **{col[1]}**\n"
-        f"📦 מספר פריטים: **{item_count}**\n\n"
+        f"⚠️ <b>בטוח שאתה רוצה למחוק את האוסף?</b>\n\n"
+        f"📌 שם האוסף: <b>{html.escape(col[1])}</b>\n"
+        f"📦 מספר פריטים: <b>{item_count}</b>\n\n"
         f"כדי לאשר מחיקה, שלח את הקוד הבא:\n"
-        f"`{code}`"
+        f"<code>{html.escape(str(code))}</code>"
     )
 
     context.user_data["verify_delete_collection_mode"] = True
 
     await query.edit_message_text(
         text=text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
              [InlineKeyboardButton("❌ ביטול", callback_data="exit_delete_mode")]
         ])
@@ -224,9 +230,9 @@ async def handle_main_menu_button(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("❌ ביטול", callback_data="cancel_share_access")]
         ])
         await query.edit_message_text(
-            "🔗 **גישה לאוסף משותף**\n\nאנא שלח את קוד השיתוף שקיבלת:",
+            "🔗 <b>גישה לאוסף משותף</b>\n\nאנא שלח את קוד השיתוף שקיבלת:",
             reply_markup=keyboard,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     elif action == "new_collection":
@@ -263,7 +269,7 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
     await query.answer()
 
     parts = parse_callback_data(query.data, "manage_collection")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -311,9 +317,9 @@ async def handle_manage_collection_callback(update: Update, context: ContextType
         ]
 
     await query.edit_message_text(
-        f"ניהול אוסף: **{col[1]}**",
+        f"ניהול אוסף: <b>{html.escape(col[1])}</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def handle_collection_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -322,7 +328,7 @@ async def handle_collection_info_callback(update: Update, context: ContextTypes.
     await query.answer()
 
     parts = parse_callback_data(query.data, "collection_info")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -348,35 +354,35 @@ async def handle_collection_info_callback(update: Update, context: ContextTypes.
             return iso_str
 
     lines = [
-        f"📊 **מידע על האוסף: {col[1]}**\n",
-        f"📦 **סה\"כ פריטים:** {stats['total_count']}",
+        f"📊 <b>מידע על האוסף: {html.escape(col[1])}</b>\n",
+        f"📦 <b>סה\"כ פריטים:</b> {stats['total_count']}",
     ]
 
     if stats["video_count"] > 0:
         lines.append(
-            f"🎬 **סרטונים:** {stats['video_count']} "
+            f"🎬 <b>סרטונים:</b> {stats['video_count']} "
             f"({fmt_size(stats['video_size_bytes'])})"
         )
 
     if stats["photo_count"] > 0:
         lines.append(
-            f"🖼 **תמונות:** {stats['photo_count']} "
+            f"🖼 <b>תמונות:</b> {stats['photo_count']} "
             f"({fmt_size(stats['photo_size_bytes'])})"
         )
 
     if stats["document_count"] > 0:
         lines.append(
-            f"📄 **קבצים:** {stats['document_count']} "
+            f"📄 <b>קבצים:</b> {stats['document_count']} "
             f"({fmt_size(stats['document_size_bytes'])})"
         )
 
     if stats["text_count"] > 0:
-        lines.append(f"💬 **הודעות טקסט:** {stats['text_count']}")
+        lines.append(f"💬 <b>הודעות טקסט:</b> {stats['text_count']}")
 
-    lines.append(f"\n💾 **גודל כולל:** {fmt_size(stats['total_size_bytes'])}")
+    lines.append(f"\n💾 <b>גודל כולל:</b> {fmt_size(stats['total_size_bytes'])}")
 
-    lines.append(f"\n📅 **פריט ראשון נוסף:** {fmt_date(stats['first_item_date'])}")
-    lines.append(f"🕐 **פריט אחרון נוסף:** {fmt_date(stats['last_item_date'])}")
+    lines.append(f"\n📅 <b>פריט ראשון נוסף:</b> {fmt_date(stats['first_item_date'])}")
+    lines.append(f"🕐 <b>פריט אחרון נוסף:</b> {fmt_date(stats['last_item_date'])}")
 
     text = "\n".join(lines)
 
@@ -384,7 +390,7 @@ async def handle_collection_info_callback(update: Update, context: ContextTypes.
         [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
     ])
 
-    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def handle_share_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,37 +400,37 @@ async def handle_share_collection_callback(update: Update, context: ContextTypes
     user = query.from_user
 
     parts = parse_callback_data(query.data, "share_collection")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
     share_code = db.create_share_link(col_id, user.id)
-    _log_share_creation(context.bot, user, col_id, share_code)
+    _log_share_creation(context, user, col_id, share_code)
 
-    logs = db.get_share_access_logs(col_id)
+    access_count = db.count_share_accesses(col_id)
     expiry = db.get_share_expiration(col_id)
     expiry_txt = f"⏱️ תפוגה: {expiry[:16].replace('T', ' ')}" if expiry else "⏱️ ללא תפוגה"
 
     text = (
-        f"קוד שיתוף לאוסף: {col[1]}\n\n"
-        f"📋 קוד: `{share_code}`\n\n"
-        f"👥 מספר גישות: {len(logs)}\n"
+        f"קוד שיתוף לאוסף: {html.escape(col[1])}\n\n"
+        f"📋 קוד: <code>{html.escape(str(share_code))}</code>\n\n"
+        f"👥 מספר גישות: {access_count}\n"
         f"{expiry_txt}\n\n"
         "💡 שלח את הקוד הזה למשתמשים אחרים.\n"
         "הם יוכלו לגשת לאוסף באמצעות הפקודה /access."
     )
 
     await query.edit_message_text(
-        text=text, parse_mode="Markdown",
+        text=text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(_build_share_keyboard(col_id))
     )
 
-def _log_share_creation(bot, user, col_id, share_code):
+def _log_share_creation(context, user, col_id, share_code):
     """Helper to log share creation activity."""
     if ENABLE_ARCHIVING:
-        asyncio.create_task(
+        context.application.create_task(
             log_activity(
-                bot=bot, action="SHARE_CREATED", user_id=user.id,
+                bot=context.bot, action="SHARE_CREATED", user_id=user.id,
                 collection_id=col_id, extra={"share_code": share_code[:10] + "..."},
                 user_name=user.full_name, username=user.username
             )
@@ -447,34 +453,44 @@ async def handle_share_stats_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
 
     parts = parse_callback_data(query.data, "share_stats")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
-    logs = db.get_share_access_logs(col_id)
-    text = _build_share_stats_text(logs)
+    total = db.count_share_accesses(col_id)
+    logs = db.get_share_access_logs(col_id, limit=50)
+    text = _build_share_stats_text(logs, total)
     keyboard = [[InlineKeyboardButton("🔙 חזור", callback_data=f"share_collection:{col_id}")]]
 
     await query.edit_message_text(
         text=text,
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
-def _build_share_stats_text(logs: list) -> str:
-    """Helper to format share access logs."""
+def _build_share_stats_text(logs: list, total: int) -> str:
+    """Helper to format share access logs (HTML, capped below Telegram's 4096 limit)."""
     if not logs:
         return "📊 אין עדיין צפיות באוסף המשותף הזה."
 
-    text = f"📊 **סטטיסטיקות צפייה ({len(logs)} משתמשים):**\n\n"
+    max_len = 3800
+    text = f"📊 <b>סטטיסטיקות צפייה ({total} משתמשים):</b>\n\n"
+    shown = 0
     for _, username, first_name, accessed_at in logs:
-        safe_username = username.replace("_", "\\_") if username else ""
-        name = f"{first_name} " + (f"(@{safe_username})" if username else "")
+        name = html.escape(f"{first_name or ''} ".lstrip())
+        if username:
+            name += f" (@{html.escape(username)})"
         try:
             date_str = accessed_at[:16].replace("T", " ")
         except (TypeError, ValueError, IndexError): # pylint: disable=broad-exception-caught
-            date_str = accessed_at
-        text += f"👤 {name} - {date_str}\n"
+            date_str = str(accessed_at)
+        line = f"👤 {name.strip()} - {html.escape(date_str)}\n"
+        if len(text) + len(line) > max_len:
+            break
+        text += line
+        shown += 1
+    if shown < total:
+        text += f"\n... ועוד {total - shown} משתמשים"
     return text
 
 async def handle_regenerate_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,7 +499,7 @@ async def handle_regenerate_share_callback(update: Update, context: ContextTypes
     await query.answer("קוד שיתוף הוחלף")
 
     parts = parse_callback_data(query.data, "regenerate_share")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -492,15 +508,15 @@ async def handle_regenerate_share_callback(update: Update, context: ContextTypes
     if new_code:
         # Provide same view as initial share creation but updated
         text = (
-            f"🔄 **הקוד הוחלף בהצלחה!**\n\n"
-            f"הקוד החדש:\n`{new_code}`\n\n"
+            f"🔄 <b>הקוד הוחלף בהצלחה!</b>\n\n"
+            f"הקוד החדש:\n<code>{html.escape(str(new_code))}</code>\n\n"
             f"הקוד הישן מבוטל ולא יעבוד יותר."
         )
         keyboard = [
              [InlineKeyboardButton("🔙 חזור", callback_data=f"manage_collection:{col_id}")]
         ]
         await query.edit_message_text(
-            text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+            text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
         )
 
 async def handle_revoke_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -508,7 +524,7 @@ async def handle_revoke_share_callback(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer("שיתוף בוטל")
     parts = parse_callback_data(query.data, "revoke_share")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -516,7 +532,7 @@ async def handle_revoke_share_callback(update: Update, context: ContextTypes.DEF
 
     # Log share revocation
     if ENABLE_ARCHIVING:
-        asyncio.create_task(
+        context.application.create_task(
             log_activity(
                 bot=context.bot,
                 action="SHARE_REVOKED",
@@ -542,7 +558,7 @@ async def handle_export_collection_callback(
     await query.answer("מכין קובץ גיבוי...")
 
     parts = parse_callback_data(query.data, "export_collection")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -579,22 +595,6 @@ async def handle_export_collection_callback(
             caption=f"📦 גיבוי מלא לאוסף: {col[1]}",
             filename=filename
         )
-
-def _generate_export_content(col_name: str, items: list) -> str:
-    """Helper to generate export file content."""
-    lines = [
-        f"# COLLECTION EXPORT: {col_name}",
-        f"# DATE: {db.datetime.now()}",
-        "# DO NOT EDIT THIS FILE",
-        ""
-    ]
-    for item in items:
-        # Format: CONTENT_TYPE|FILE_ID|TEXT|FILENAME|SIZE
-        text = (item[3] or "").replace("|", "<PIPE>").replace("\n", "<NL>")
-        f_name = item[4] or ""
-        f_size = str(item[5]) if item[5] else "0"
-        lines.append(f"{item[1]}|{item[2]}|{text}|{f_name}|{f_size}")
-    return "\n".join(lines)
 
 async def handle_delete_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a collection with confirmation"""
@@ -663,7 +663,7 @@ async def handle_set_share_expiration_callback(update: Update, context: ContextT
     await query.answer()
 
     parts = parse_callback_data(query.data, "set_share_expiration")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -697,7 +697,7 @@ async def handle_save_share_expiration_callback(update: Update, context: Context
     await query.answer()
     user = query.from_user
     parts = parse_callback_data(query.data, "save_share_exp")
-    is_allowed, collection_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, collection_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -754,7 +754,7 @@ async def handle_custom_share_expiration_callback(
     await query.answer()
 
     parts = parse_callback_data(query.data, "custom_share_exp")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -812,11 +812,11 @@ async def handle_custom_share_expiration_callback(
     # Don't edit if nothing changed (to avoid Telegram errors)
     try:
         await query.edit_message_text(
-            f"⏱️ **הגדרת זמן תפוגה מותאם אישית**\n\n"
-            f"זמן נבחר: **{time_str}**\n\n"
+            f"⏱️ <b>הגדרת זמן תפוגה מותאם אישית</b>\n\n"
+            f"זמן נבחר: <b>{time_str}</b>\n\n"
             f"השתמש בכפתורים כדי לשנות:",
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e: # pylint: disable=broad-exception-caught
         if "message is not modified" not in str(e).lower():
@@ -832,7 +832,7 @@ async def handle_save_custom_share_expiration_callback(
     user = query.from_user
 
     parts = parse_callback_data(query.data, "save_share_exp_custom")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 

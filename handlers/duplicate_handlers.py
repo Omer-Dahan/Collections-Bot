@@ -6,19 +6,21 @@ Scanning logic — two independent passes:
   Catches files forwarded multiple times into the collection.
   NOTE: re-uploading the same file gives a different file_unique_id,
   so this pass alone is NOT sufficient.
-- Pass 2 (Re-upload duplicates): items with the same (content_type, file_size, file_name).
+- Pass 2 (Re-upload duplicates): video/document/audio items with the same
+  (content_type, file_size, file_name), only when file_size > 0 and file_name is non-empty.
   Catches the common case of the user adding the same file more than once.
-  Applied to ALL items, including those with a file_unique_id.
+  Photos are matched ONLY by file_unique_id (they have no name, so size alone is unsafe).
 
 Within each duplicate group the first item (lowest ID) is kept as the "original"
 and all subsequent items are marked as duplicates to be deleted.
 """
+import html
 import logging
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 
 import db
-from utils import parse_callback_data, parse_and_validate_access
+from utils import parse_callback_data, parse_and_validate_owner
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +47,10 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
       this pass will NOT catch re-uploads. That is why Pass 2 is needed.
 
     Pass 2 — Re-upload duplicates (file_size + file_name):
-      Applied to ALL items (including those with a file_unique_id).
-      Two files are considered duplicates if they share the same content_type,
-      file_size, and file_name. This catches the most common case where a user
-      adds the same file from their gallery multiple times.
-      Risk of false positives is low when both size AND name match.
-      Items with no file_size are skipped (cannot be compared).
-      file_name is normalized to "" when NULL.
+      Only video/document/audio items with file_size > 0 and a non-empty
+      file_name are considered. Two such files are duplicates if they share the
+      same content_type, file_size, and file_name. Photos (no name) and imported
+      items (size 0) are never matched here, to avoid false positives.
 
     Groups from both passes are merged: if an item already belongs to a group
     from Pass 1, it will not create a separate group in Pass 2.
@@ -63,6 +62,7 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
         - fallback_count: groups found via file_size+name (Pass 2)
     """
     SCANNABLE = ("video", "photo", "document", "audio")
+    REUPLOAD_TYPES = ("video", "document", "audio")
 
     # --- Pass 1: Forward duplicates via file_unique_id ---
     forward_map: dict[tuple, list] = {}
@@ -84,12 +84,11 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
     reupload_map: dict[tuple, list] = {}
     for item in items:
         item_id, content_type, file_size, file_name, file_unique_id = item
-        if content_type not in SCANNABLE:
+        if content_type not in REUPLOAD_TYPES:
             continue
-        if file_size is None:
-            continue  # no size data — cannot compare
-        normalized_name = file_name or ""
-        key = (content_type, file_size, normalized_name)
+        if not file_size or file_size <= 0 or not file_name:
+            continue  # not enough data to compare safely
+        key = (content_type, file_size, file_name)
         reupload_map.setdefault(key, []).append(item)
 
     reupload_groups = []
@@ -106,12 +105,6 @@ def _compute_duplicates(items: list) -> tuple[list[list[tuple]], int, int]:
 
     groups = forward_groups + reupload_groups
     return groups, reliable_count, fallback_count
-
-
-# Keep old per-type functions removed — replaced by _compute_duplicates above
-
-
-
 
 
 
@@ -142,17 +135,17 @@ def _build_page_text(
 ) -> str:
     """Build the text for a single page of the duplicate report."""
     lines = [
-        "🔍 *דוח כפולים*",
-        f"נמצאו *{total_groups}* קבוצות | *{total_dupes}* קבצים לא נחוצים",
-        f"עמוד *{page}/{total_pages}*",
+        "🔍 <b>דוח כפולים</b>",
+        f"נמצאו <b>{total_groups}</b> קבוצות | <b>{total_dupes}</b> קבצים לא נחוצים",
+        f"עמוד <b>{page}/{total_pages}</b>",
     ]
 
     # Scan method footnote
     if fallback_count > 0 and reliable_count == 0:
-        lines.append("⚠️ _סריקה לפי גודל קובץ (פריטים ישנים — ללא מזהה ייחודי)._")
+        lines.append("⚠️ <i>סריקה לפי גודל ושם קובץ (פריטים ישנים — ללא מזהה ייחודי).</i>")
     elif fallback_count > 0:
         lines.append(
-            f"🔶 _{reliable_count} מדויק, {fallback_count} לפי גודל (ישנים)._"
+            f"🔶 <i>{reliable_count} מדויק, {fallback_count} לפי גודל ושם (ישנים).</i>"
         )
 
     lines += [
@@ -166,14 +159,14 @@ def _build_page_text(
         content_type = group[0][1]
         emoji = _TYPE_EMOJI.get(content_type, "📁")
         count = len(group)
-        lines.append(f"\n{emoji} *קבוצה {global_idx}* ({content_type}) — {count} עותקים")
+        lines.append(f"\n{emoji} <b>קבוצה {global_idx}</b> ({html.escape(str(content_type))}) — {count} עותקים")
 
         # Limit displayed items to prevent exceeding Telegram's 4096 character limit
         display_limit = 5
         for pos, item in enumerate(group[:display_limit]):
             item_id = item[0]
             label = "✅ מקור " if pos == 0 else "❌ כפול"
-            lines.append(f"  {label} | ID: `{item_id}`")
+            lines.append(f"  {label} | ID: <code>{item_id}</code>")
             
         if count > display_limit:
             lines.append(f"  ... ועוד {count - display_limit} עותקים לא מוצגים")
@@ -249,12 +242,13 @@ async def handle_scan_duplicates_callback(
     Scans the collection and sends the first page of the duplicate report.
     """
     query = update.callback_query
-    await query.answer("⏳ סורק כפולים...")
 
     parts = parse_callback_data(query.data, "scan_duplicates")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
+        await query.answer()
         return
+    await query.answer("⏳ סורק כפולים...")
 
     # Replace a prior unfinished scan instead of retaining its potentially
     # large groups in this user's in-memory session.
@@ -279,10 +273,10 @@ async def handle_scan_duplicates_callback(
     if not duplicate_groups:
         note = ""
         if fallback_count > 0:
-            note = "\n\n⚠️ _הסריקה בוצעה לפי גודל קובץ (פריטים ישנים)._"
+            note = "\n\n⚠️ <i>הסריקה בוצעה לפי גודל ושם קובץ (פריטים ישנים).</i>"
         await query.edit_message_text(
             f"✅ לא נמצאו קבצים כפולים באוסף זה!{note}",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
             ])
@@ -301,7 +295,7 @@ async def handle_scan_duplicates_callback(
 
     # Render page 1
     text, keyboard = _render_page_data(context, col_id, page=1)
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def handle_dupes_page_callback(
@@ -312,7 +306,7 @@ async def handle_dupes_page_callback(
     await query.answer()
 
     parts = parse_callback_data(query.data, "dupes_page")
-    is_allowed, col_id, _ = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
         return
 
@@ -334,7 +328,7 @@ async def handle_dupes_page_callback(
         return
 
     try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     except Exception:  # pylint: disable=broad-exception-caught
         pass  # Ignore "message not modified" errors
 
@@ -347,12 +341,25 @@ async def handle_confirm_delete_dupes_callback(
     Deletes them from the database and sends a summary.
     """
     query = update.callback_query
-    await query.answer("🗑 מוחק כפולים...")
 
     parts = parse_callback_data(query.data, "confirm_delete_dupes")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
+        await query.answer()
         return
+
+    # The cached scan must belong to this collection
+    if context.user_data.get("duplicate_scan_col_id") != col_id:
+        await query.answer()
+        await query.edit_message_text(
+            "⚠️ לא נמצאו נתוני סריקה עבור אוסף זה. אנא סרוק שוב.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
+            ])
+        )
+        return
+
+    await query.answer("🗑 מוחק כפולים...")
 
     # Retrieve and clear pending data
     duplicate_ids = context.user_data.pop(_PENDING_DELETE_KEY, [])
@@ -370,17 +377,17 @@ async def handle_confirm_delete_dupes_callback(
         )
         return
 
-    deleted_count = db.delete_items_by_ids(duplicate_ids)
+    deleted_count = db.delete_items_by_ids(duplicate_ids, collection_id=col_id)
     remaining = db.count_items_in_collection(col_id)
 
     text = (
-        f"✅ *{deleted_count} קבצים כפולים נמחקו בהצלחה!*\n\n"
-        f"📦 האוסף *{col[1]}* מכיל כעת *{remaining}* קבצים."
+        f"✅ <b>{deleted_count} קבצים כפולים נמחקו בהצלחה!</b>\n\n"
+        f"📦 האוסף <b>{html.escape(col[1])}</b> מכיל כעת <b>{remaining}</b> קבצים."
     )
 
     await query.edit_message_text(
         text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 חזור לניהול", callback_data=f"manage_collection:{col_id}")]
         ])

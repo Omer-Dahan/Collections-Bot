@@ -1,14 +1,21 @@
 # db.py
+import logging
+import os
+import secrets
 import sqlite3
+import string
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from config import ADMIN_IDS
 
-DB_PATH = "bot_data.db"
+logger = logging.getLogger(__name__)
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -116,6 +123,7 @@ def migrate_db():
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS collections (
@@ -197,7 +205,20 @@ def init_db():
     )
     """)
     
+    # Per-user favorites; rows vanish with their item via FK cascade
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        added_at TEXT NOT NULL,
+        UNIQUE(user_id, item_id),
+        FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )
+    """)
+
     # Add indices for better performance
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_favorites_item ON favorites(item_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_file_id ON items(file_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_user ON collections(user_id)")
@@ -288,6 +309,63 @@ def get_item_by_id(item_id: int) -> tuple | None:
         return cur.fetchone()
 
 
+def toggle_favorite(user_id: int, item_id: int) -> bool:
+    """Flip the favorite mark for this user. Returns the new state."""
+    with db_transaction() as (conn, cur):
+        cur.execute(
+            "DELETE FROM favorites WHERE user_id = ? AND item_id = ?",
+            (user_id, item_id)
+        )
+        if cur.rowcount:
+            return False
+        cur.execute(
+            "INSERT INTO favorites (user_id, item_id, added_at) VALUES (?, ?, ?)",
+            (user_id, item_id, datetime.now().isoformat())
+        )
+        return True
+
+
+def is_favorite(user_id: int, item_id: int) -> bool:
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND item_id = ?",
+            (user_id, item_id)
+        )
+        return cur.fetchone() is not None
+
+
+def count_favorites(user_id: int, collection_id: int) -> int:
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM favorites f
+            JOIN items i ON i.id = f.item_id
+            WHERE f.user_id = ? AND i.collection_id = ?
+            """,
+            (user_id, collection_id)
+        )
+        (count,) = cur.fetchone()
+        return count
+
+
+def get_favorite_items(user_id: int, collection_id: int, offset: int = 0, limit: int = 10) -> list:
+    """Same row shape as get_items_by_collection, newest favorite first."""
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            """
+            SELECT i.id, i.content_type, i.file_id, i.text_content, i.file_name, i.file_size, i.added_at
+            FROM favorites f
+            JOIN items i ON i.id = f.item_id
+            WHERE f.user_id = ? AND i.collection_id = ?
+            ORDER BY f.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, collection_id, limit, offset)
+        )
+        return cur.fetchall()
+
+
 def count_items_in_collection(collection_id: int) -> int:
     with db_transaction(commit=False) as (conn, cur):
         cur.execute(
@@ -362,9 +440,6 @@ def delete_all_items_in_collection(collection_id: int) -> int:
 
 def delete_collection(collection_id: int) -> bool:
     """Delete a collection (after deleting all its items)"""
-    import logging
-    logger = logging.getLogger(__name__)
-    
     with db_transaction() as (conn, cur):
         try:
             # Step 1: Delete access logs for share codes of this collection
@@ -403,15 +478,53 @@ def delete_collection(collection_id: int) -> bool:
             raise
 
 
-def delete_item(collection_id: int, file_id: str) -> bool:
-    """Delete a specific item from a collection by file_id"""
-    with db_transaction() as (conn, cur):
-        try:
-            cur.execute("DELETE FROM items WHERE collection_id = ? AND file_id = ?", (collection_id, file_id))
+def delete_item(collection_id: int, file_id: str, file_unique_id: str | None = None) -> bool:
+    """
+    Delete a specific item from a collection by file_id.
+    If file_unique_id is given, items matching either identifier are deleted.
+    """
+    try:
+        with db_transaction() as (conn, cur):
+            if file_unique_id:
+                cur.execute(
+                    "DELETE FROM items WHERE collection_id = ? AND (file_unique_id = ? OR file_id = ?)",
+                    (collection_id, file_unique_id, file_id),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM items WHERE collection_id = ? AND file_id = ?",
+                    (collection_id, file_id),
+                )
             return cur.rowcount > 0
-        except Exception:
-            logger.exception("delete_item failed (collection_id=%s, file_id=%s)", collection_id, file_id)
-            return False
+    except Exception:
+        logger.exception("delete_item failed (collection_id=%s, file_id=%s)", collection_id, file_id)
+        return False
+
+
+def add_items_bulk(collection_id: int, rows: list[tuple]) -> int:
+    """
+    Insert many items in one transaction.
+    Each row is (content_type, file_id, text_content, file_name, file_size).
+    Returns the number of inserted rows.
+    """
+    if not rows:
+        return 0
+    added_at = datetime.now().isoformat()
+    params = [
+        (collection_id, content_type, file_id, text_content, file_name, file_size, added_at)
+        for content_type, file_id, text_content, file_name, file_size in rows
+    ]
+    with db_transaction() as (conn, cur):
+        cur.executemany(
+            """
+            INSERT INTO items
+                (collection_id, content_type, file_id, file_unique_id,
+                 text_content, file_name, file_size, added_at)
+            VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        return cur.rowcount
 
 
 def get_all_collections_paginated(offset: int = 0, limit: int = 12) -> list:
@@ -458,10 +571,11 @@ def clone_collection_for_user(source_collection_id: int, target_user_id: int) ->
     Create a copy of an existing collection and all its items
     for another user (for example: the admin).
 
-    Returns the new collection id, or 0 on failure.
+    On a name collision the copy is named "<name> (copy)", "<name> (copy 2)", ...
+    Returns the new collection id, or 0 on failure (nothing is persisted).
     """
-    with db_transaction() as (conn, cur):
-        try:
+    try:
+        with db_transaction() as (conn, cur):
             # Get collection name
             cur.execute("SELECT name FROM collections WHERE id = ?", (source_collection_id,))
             row = cur.fetchone()
@@ -470,26 +584,67 @@ def clone_collection_for_user(source_collection_id: int, target_user_id: int) ->
 
             original_name = row[0]
 
-            # Create new collection for target user
-            cur.execute(
-                "INSERT INTO collections (name, user_id) VALUES (?, ?)",
-                (original_name, target_user_id),
-            )
-            new_collection_id = cur.lastrowid
+            # Create new collection for target user, retrying on UNIQUE(name, user_id)
+            new_collection_id = None
+            for attempt in range(1, 101):
+                if attempt == 1:
+                    name = original_name
+                elif attempt == 2:
+                    name = f"{original_name} (copy)"
+                else:
+                    name = f"{original_name} (copy {attempt - 1})"
+                try:
+                    cur.execute(
+                        "INSERT INTO collections (name, user_id) VALUES (?, ?)",
+                        (name, target_user_id),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                new_collection_id = cur.lastrowid
+                break
+
+            if new_collection_id is None:
+                raise RuntimeError("Could not find a free collection name")
 
             # Copy all items from source collection to new collection
             cur.execute(
                 """
-                INSERT INTO items (collection_id, content_type, file_id, text_content, file_name, file_size, added_at)
-                SELECT ?, content_type, file_id, text_content, file_name, file_size, added_at
+                INSERT INTO items (collection_id, content_type, file_id, file_unique_id,
+                                   text_content, file_name, file_size, added_at)
+                SELECT ?, content_type, file_id, file_unique_id,
+                       text_content, file_name, file_size, added_at
                 FROM items
                 WHERE collection_id = ?
                 """,
                 (new_collection_id, source_collection_id),
             )
             return new_collection_id
-        except Exception:
-            return 0
+    except Exception:
+        logger.exception("clone_collection_for_user failed (source=%s)", source_collection_id)
+        return 0
+
+
+def get_users_with_collections_page(offset: int = 0, limit: int = 20) -> list:
+    """Return (user_id, username, first_name) for distinct collection owners, by user_id."""
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            """
+            SELECT DISTINCT c.user_id, u.username, u.first_name
+            FROM collections c
+            LEFT JOIN users u ON c.user_id = u.user_id
+            ORDER BY c.user_id
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        return cur.fetchall()
+
+
+def count_users_with_collections() -> int:
+    """Count distinct users that own at least one collection."""
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute("SELECT COUNT(DISTINCT user_id) FROM collections")
+        return cur.fetchone()[0]
 
 
 def get_global_stats() -> dict:
@@ -513,8 +668,6 @@ def get_global_stats() -> dict:
 
 def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None) -> bool:
     """Insert or update user details. Returns True if user is blocked."""
-    from datetime import datetime
-
     with db_transaction() as (conn, cur):
         cur.execute("SELECT first_seen, blocked FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
@@ -555,6 +708,14 @@ def get_user(user_id: int):
                 self.blocked = blocked
         
         return UserInfo(row[0], row[1], row[2], row[3], row[4], row[5] if len(row) > 5 else 0)
+
+
+def is_user_blocked(user_id: int) -> bool:
+    """Return True if the user exists and is blocked."""
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
 def block_user(user_id: int) -> bool:
@@ -613,17 +774,14 @@ def generate_share_code() -> str:
     Length: 15-20 characters.
     Ensures uniqueness by checking against existing codes.
     """
-    import random
-    import string
-    
     chars = string.ascii_letters + string.digits  # A-Za-z0-9
-    
+
     with db_transaction(commit=False) as (conn, cur):
         max_attempts = 100
         for _ in range(max_attempts):
             # Generate random length between 15-20
-            length = random.randint(15, 20)
-            code = ''.join(random.choice(chars) for _ in range(length))
+            length = 15 + secrets.randbelow(6)
+            code = ''.join(secrets.choice(chars) for _ in range(length))
             
             # Check if code already exists
             cur.execute("SELECT COUNT(*) FROM shared_collections WHERE share_code = ?", (code,))
@@ -642,6 +800,8 @@ def create_share_link(collection_id: int, user_id: int) -> str:
     Otherwise, generate a new one.
     """
     with db_transaction() as (conn, cur):
+        # Take the write lock first so check + insert is atomic across processes
+        cur.execute("BEGIN IMMEDIATE")
         # Check if active share code already exists
         cur.execute("""
             SELECT share_code FROM shared_collections 
@@ -729,47 +889,95 @@ def log_share_access(share_code: str, user_id: int):
         """, (share_code, user_id, accessed_at))
 
 
-def get_share_access_logs(collection_id: int) -> list:
+def get_share_access_logs(collection_id: int, limit: int | None = None) -> list:
     """
     Get access logs for a shared collection.
     Returns list of (user_id, username, first_name, accessed_at) tuples.
     """
+    query = """
+        SELECT sal.user_id, u.username, u.first_name, sal.accessed_at
+        FROM shared_collection_access_log sal
+        JOIN shared_collections sc ON sal.share_code = sc.share_code
+        LEFT JOIN users u ON sal.user_id = u.user_id
+        WHERE sc.collection_id = ? AND sc.is_active = 1
+        ORDER BY sal.accessed_at DESC
+    """
+    params: tuple = (collection_id,)
+    if limit is not None:
+        query += " LIMIT ?"
+        params += (limit,)
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(query, params)
+        return cur.fetchall()
+
+
+def count_share_accesses(collection_id: int) -> int:
+    """Count access log rows for the active share(s) of a collection."""
     with db_transaction(commit=False) as (conn, cur):
         cur.execute("""
-            SELECT sal.user_id, u.username, u.first_name, sal.accessed_at
+            SELECT COUNT(*)
             FROM shared_collection_access_log sal
             JOIN shared_collections sc ON sal.share_code = sc.share_code
-            LEFT JOIN users u ON sal.user_id = u.user_id
             WHERE sc.collection_id = ? AND sc.is_active = 1
-            ORDER BY sal.accessed_at DESC
         """, (collection_id,))
-        return cur.fetchall()
+        return cur.fetchone()[0]
 
 
 # --- Admin Shares Management Functions ---
 
-def get_all_active_shares() -> list:
+_ACTIVE_SHARES_SELECT = """
+    SELECT
+        sc.id, sc.share_code, sc.collection_id, c.name as collection_name,
+        sc.created_by, u.username as creator_username,
+        sc.created_at,
+        COUNT(DISTINCT sal.user_id) as unique_users,
+        COUNT(sal.id) as total_accesses
+    FROM shared_collections sc
+    JOIN collections c ON sc.collection_id = c.id
+    LEFT JOIN users u ON sc.created_by = u.user_id
+    LEFT JOIN shared_collection_access_log sal ON sc.share_code = sal.share_code
+    WHERE sc.is_active = 1
+"""
+_ACTIVE_SHARES_GROUP = """
+    GROUP BY sc.id, sc.share_code, sc.collection_id, c.name, sc.created_by, u.username, sc.created_at
+"""
+
+
+def get_all_active_shares(offset: int = 0, limit: int | None = None) -> list:
     """
-    Get all active shares for admin panel.
+    Get active shares for admin panel (all by default, or one page).
     Returns list with share details and access counts.
     """
+    query = _ACTIVE_SHARES_SELECT + _ACTIVE_SHARES_GROUP + " ORDER BY sc.created_at DESC"
+    params: tuple = ()
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params = (limit, offset)
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(query, params)
+        return cur.fetchall()
+
+
+def count_active_shares() -> int:
+    """Count active shares that appear in the admin shares list."""
     with db_transaction(commit=False) as (conn, cur):
         cur.execute("""
-            SELECT 
-                sc.id, sc.share_code, sc.collection_id, c.name as collection_name,
-                sc.created_by, u.username as creator_username,
-                sc.created_at,
-                COUNT(DISTINCT sal.user_id) as unique_users,
-                COUNT(sal.id) as total_accesses
+            SELECT COUNT(*)
             FROM shared_collections sc
             JOIN collections c ON sc.collection_id = c.id
-            LEFT JOIN users u ON sc.created_by = u.user_id
-            LEFT JOIN shared_collection_access_log sal ON sc.share_code = sal.share_code
             WHERE sc.is_active = 1
-            GROUP BY sc.id, sc.share_code, sc.collection_id, c.name, sc.created_by, u.username, sc.created_at
-            ORDER BY sc.created_at DESC
         """)
-        return cur.fetchall()
+        return cur.fetchone()[0]
+
+
+def get_active_share_by_id(share_id: int) -> tuple | None:
+    """Get one active share row, same shape as get_all_active_shares rows."""
+    with db_transaction(commit=False) as (conn, cur):
+        cur.execute(
+            _ACTIVE_SHARES_SELECT + " AND sc.id = ?" + _ACTIVE_SHARES_GROUP,
+            (share_id,),
+        )
+        return cur.fetchone()
 
 
 def get_share_stats(share_code: str) -> dict:
@@ -986,6 +1194,15 @@ def purge_old_share_data(access_log_days: int = 90) -> tuple[int, int]:
             )
         """)
         message_rows = cur.rowcount
+        # Active shares without an expiry never run the cleanup job, so these rows are unused
+        cur.execute("""
+            DELETE FROM shared_messages_to_delete
+            WHERE share_code IN (
+                SELECT share_code FROM shared_collections
+                WHERE is_active = 1 AND expires_at IS NULL
+            )
+        """)
+        message_rows += cur.rowcount
         cutoff = (datetime.now() - timedelta(days=access_log_days)).isoformat()
         cur.execute(
             "DELETE FROM shared_collection_access_log WHERE accessed_at < ?", (cutoff,)
@@ -1025,6 +1242,12 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
     Fetch all items in a collection that are eligible for duplicate detection.
     Only returns items with a file_id (skips text-only items).
 
+    Matching rules: items sharing (content_type, file_unique_id) are candidates
+    for any type (photos only match this way).  Videos, documents and audio
+    are additionally matched by (content_type, file_size, file_name), but only
+    when file_size > 0 and file_name is non-empty, so unnamed or imported items
+    (size 0) are never flagged by that heuristic.
+
     The duplicate algorithm does not need Telegram's often-long ``file_id``,
     so it is intentionally omitted to keep a large scan compact in memory.
 
@@ -1047,11 +1270,13 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
                 HAVING COUNT(*) > 1
             ),
             reupload_keys AS (
-                SELECT content_type, file_size, COALESCE(file_name, '') AS file_name
+                SELECT content_type, file_size, file_name
                 FROM items
                 WHERE collection_id = ? AND file_id IS NOT NULL
-                  AND file_size IS NOT NULL
-                GROUP BY content_type, file_size, COALESCE(file_name, '')
+                  AND content_type IN ('video', 'document', 'audio')
+                  AND file_size > 0
+                  AND file_name IS NOT NULL AND file_name != ''
+                GROUP BY content_type, file_size, file_name
                 HAVING COUNT(*) > 1
             )
             SELECT DISTINCT i.id, i.content_type, i.file_size, i.file_name, i.file_unique_id
@@ -1060,7 +1285,7 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
               ON f.content_type = i.content_type AND f.file_unique_id = i.file_unique_id
             LEFT JOIN reupload_keys r
               ON r.content_type = i.content_type AND r.file_size = i.file_size
-             AND r.file_name = COALESCE(i.file_name, '')
+             AND r.file_name = i.file_name
             WHERE i.collection_id = ? AND i.file_id IS NOT NULL
               AND (f.file_unique_id IS NOT NULL OR r.file_size IS NOT NULL)
             ORDER BY i.id
@@ -1070,12 +1295,13 @@ def get_all_items_for_duplicate_scan(collection_id: int) -> list:
         return cur.fetchall()
 
 
-def delete_items_by_ids(item_ids: list[int]) -> int:
+def delete_items_by_ids(item_ids: list[int], collection_id: int | None = None) -> int:
     """
     Delete multiple items by their IDs in batched transactions to avoid SQLite limits.
 
     Args:
         item_ids: List of item IDs to delete
+        collection_id: If given, only items of this collection are deleted
 
     Returns:
         Number of rows deleted
@@ -1089,10 +1315,12 @@ def delete_items_by_ids(item_ids: list[int]) -> int:
         for i in range(0, len(item_ids), batch_size):
             chunk = item_ids[i:i + batch_size]
             placeholders = ",".join("?" * len(chunk))
-            cur.execute(
-                f"DELETE FROM items WHERE id IN ({placeholders})",
-                chunk
-            )
+            query = f"DELETE FROM items WHERE id IN ({placeholders})"
+            params = list(chunk)
+            if collection_id is not None:
+                query += " AND collection_id = ?"
+                params.append(collection_id)
+            cur.execute(query, params)
             total_deleted += cur.rowcount
     return total_deleted
 

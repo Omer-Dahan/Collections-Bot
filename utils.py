@@ -18,6 +18,7 @@ from telegram import (
     InputMediaVideo,
     InputMediaPhoto,
     InputMediaDocument,
+    InputMediaAudio,
 )
 from telegram.ext import ContextTypes
 from telegram.error import NetworkError, RetryAfter
@@ -42,6 +43,36 @@ def touch_user_activity(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mark user data as active so the periodic cleanup can safely evict it."""
     context.user_data["_last_activity_at"] = time.time()
 
+# One background job per user (e.g. send-all, scans) to prevent parallel floods.
+_user_jobs: dict[int, asyncio.Task] = {}
+
+
+def start_user_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, coro) -> bool:
+    """
+    Run a coroutine as a background task unless the user already has one running.
+    Returns True if started, False if rejected (the coroutine is closed).
+    """
+    existing = _user_jobs.get(user_id)
+    if existing and not existing.done():
+        coro.close()
+        return False
+
+    task = context.application.create_task(coro)
+    _user_jobs[user_id] = task
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        if _user_jobs.get(user_id) is done_task:
+            _user_jobs.pop(user_id, None)
+        if done_task.cancelled():
+            return
+        exc = done_task.exception()
+        if exc:
+            logger.error("Background job for user %s failed: %s", user_id, exc, exc_info=exc)
+
+    task.add_done_callback(_on_done)
+    return True
+
+
 # Custom filter - only user action logs and errors
 class UserActionFilter(logging.Filter):
     def filter(self, record):
@@ -49,7 +80,10 @@ class UserActionFilter(logging.Filter):
         if record.levelno >= logging.WARNING:  # Errors always
             return True
         # Only logs from our bot packages
-        return record.name == "__main__" or record.name.startswith("handlers")
+        return (
+            record.name in ("__main__", "utils")
+            or record.name.startswith("handlers")
+        )
 
 
 def parse_callback_data(data: str, prefix: str = None) -> list[str] | None:
@@ -74,11 +108,14 @@ def parse_callback_data(data: str, prefix: str = None) -> list[str] | None:
     return parts
 
 
-async def validate_access_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, collection_id: int) -> tuple[bool, object]:
+async def validate_access_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, collection_id: int, checker=None) -> tuple[bool, object]:
     """
-    Wrapper for check_collection_access that handles user feedback.
+    Wrapper for an access checker (default: check_collection_access) that handles user feedback.
     Returns (is_allowed, collection_obj).
     """
+    if checker is None:
+        checker = check_collection_access
+
     if hasattr(update, 'callback_query') and update.callback_query:
         user_id = update.callback_query.from_user.id
         message_func = update.callback_query.edit_message_text
@@ -86,7 +123,7 @@ async def validate_access_wrapper(update: Update, context: ContextTypes.DEFAULT_
         user_id = update.effective_user.id
         message_func = update.effective_chat.send_message if update.effective_chat else None
 
-    is_allowed, error_msg, collection = check_collection_access(user_id, collection_id)
+    is_allowed, error_msg, collection = checker(user_id, collection_id)
 
     if not is_allowed and message_func:
         try:
@@ -109,6 +146,19 @@ async def parse_and_validate_access(update: Update, context: ContextTypes.DEFAUL
         return False, None, None
 
     is_allowed, col = await validate_access_wrapper(update, context, col_id)
+    return is_allowed, col_id, col
+
+async def parse_and_validate_owner(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list, index: int = 0):
+    """
+    Like parse_and_validate_access, but only the owner (or an admin) is allowed.
+    Returns (is_allowed, col_id, col_obj).
+    """
+    try:
+        col_id = int(parts[index])
+    except (ValueError, IndexError):
+        return False, None, None
+
+    is_allowed, col = await validate_access_wrapper(update, context, col_id, checker=check_owner_access)
     return is_allowed, col_id, col
 
 def extract_file_info(message):
@@ -282,6 +332,7 @@ def reset_user_modes(context: ContextTypes.DEFAULT_TYPE, user_id: int = None):
     # 1. Clear session-based flags in user_data
     for key in ["delete_mode", "id_mode", "waiting_for_share_code", 
                 "verify_delete_collection", "verify_send_collection",
+                "verify_send_collection_mode", "verify_delete_collection_mode",
                 "import_mode", "creating_collection_mode", "temp_collection_name", "allowed_item_ids", "info_page_collection_id",
                 "info_page_page", "info_page_info_page", "info_message_id",
                 "from_search_results", "waiting_for_search_query", "search_from_message_id",
@@ -347,6 +398,21 @@ def check_collection_access(user_id: int, collection_id: int) -> tuple[bool, str
             return True, "", collection
     
     return False, "אין לך גישה לאוסף הזה.", None
+
+
+def check_owner_access(user_id: int, collection_id: int) -> tuple[bool, str, tuple | None]:
+    """
+    Check if user owns the collection (or is admin). Shared access is NOT enough.
+    Returns: (is_allowed, error_message, collection_object)
+    """
+    collection = db.get_collection_by_id(collection_id)
+    if not collection:
+        return False, "האוסף לא נמצא (אולי נמחק?).", None
+
+    if collection[2] == user_id or is_admin(user_id):
+        return True, "", collection
+
+    return False, "אין לך הרשאה לנהל את האוסף הזה.", None
 
 
 # track_shared_messages removed (dead code)
@@ -416,6 +482,8 @@ def prepare_media_groups(items: list) -> tuple[list, list, list]:
             media_visual.append(InputMediaPhoto(media=file_id, caption=caption))
         elif content_type == "document":
             media_docs.append(InputMediaDocument(media=file_id, filename=file_name, caption=caption))
+        elif content_type == "audio":
+            media_docs.append(InputMediaAudio(media=file_id, caption=caption, filename=file_name))
 
     return media_visual, media_docs, text_items
 
@@ -432,7 +500,12 @@ async def _send_item_individually(bot, chat_id: int, item) -> list:
         elif isinstance(item, InputMediaPhoto):
             msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
         elif isinstance(item, InputMediaDocument):
-            msg = await bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+            msg = await bot.send_document(
+                chat_id=chat_id, document=file_id, caption=caption,
+                filename=getattr(item, 'filename', None)
+            )
+        elif isinstance(item, InputMediaAudio):
+            msg = await bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption)
         else:
             return []
         return [msg]
@@ -506,7 +579,7 @@ async def send_media_groups_in_chunks(
         bot: The bot instance
         chat_id: Target chat ID
         media_visual: List of InputMediaPhoto/InputMediaVideo
-        media_docs: List of InputMediaDocument
+        media_docs: List of InputMediaDocument / InputMediaAudio
         text_items: List of text strings to send
         chunk_size: Max items per media group (Telegram limit is 10)
         user_id: User ID for tracking messages in shared sessions
@@ -541,16 +614,19 @@ async def send_media_groups_in_chunks(
         if i + chunk_size < len(media_visual):
             await asyncio.sleep(4)
     
-    # Send documents
-    for i in range(0, len(media_docs), chunk_size):
-        chunk = media_docs[i:i + chunk_size]
-        messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
-        for m in messages:
-            sent_message_ids.append(m.message_id)
-            if user_id:
-                track_if_shared(user_id, chat_id, m.message_id)
-        if i + chunk_size < len(media_docs):
-            await asyncio.sleep(4)
+    # Send documents and audio separately: Telegram forbids mixing them in one album
+    docs_only = [m for m in media_docs if not isinstance(m, InputMediaAudio)]
+    audio_only = [m for m in media_docs if isinstance(m, InputMediaAudio)]
+    for group in (docs_only, audio_only):
+        for i in range(0, len(group), chunk_size):
+            chunk = group[i:i + chunk_size]
+            messages = await safe_send_media_group(bot, chat_id=chat_id, media=chunk)
+            for m in messages:
+                sent_message_ids.append(m.message_id)
+                if user_id:
+                    track_if_shared(user_id, chat_id, m.message_id)
+            if i + chunk_size < len(group):
+                await asyncio.sleep(4)
     
     return sent_message_ids
 
@@ -626,14 +702,15 @@ def get_main_menu_text() -> str:
 
 async def batch_status_loop(chat_id: int, collection_id: int, collection_name: str, context: ContextTypes.DEFAULT_TYPE, user_data_status: dict):
     """Background loop to update status message every few seconds"""
+    failures = 0
     try:
         while True:
             current_count = user_data_status["count"]
             last_sent_count = user_data_status.get("last_sent_count", 0)
-            
+
             # If count changed or message doesn't exist, send update
             if current_count != last_sent_count or not user_data_status.get("msg_id"):
-                
+
                 # Delete old message if exists
                 old_msg_id = user_data_status.get("msg_id")
                 if old_msg_id:
@@ -641,7 +718,7 @@ async def batch_status_loop(chat_id: int, collection_id: int, collection_name: s
                         await context.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
                     except Exception:
                         pass
-                
+
                 # Send new message
                 text = f"✅ נוספו קבצים לאוסף \"{collection_name}\""
                 keyboard = InlineKeyboardMarkup([
@@ -650,24 +727,31 @@ async def batch_status_loop(chat_id: int, collection_id: int, collection_name: s
                         InlineKeyboardButton("🏠 חזרה לבית", callback_data="back_to_main")
                     ]
                 ])
-                
+
                 try:
                     msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
                     user_data_status["msg_id"] = msg.message_id
-                    user_data_status["last_sent_count"] = current_count
+                    failures = 0
                 except Exception as e:
                     logger.error("Error sending batch status: %s", e)
-            
+                    user_data_status["msg_id"] = None
+                    failures += 1
+                    if failures >= 3:
+                        break
+                finally:
+                    # Always advance so a failing send cannot spin the loop forever
+                    user_data_status["last_sent_count"] = current_count
+
             # Wait 2 seconds
             await asyncio.sleep(2)
-            
+
             if user_data_status["count"] == user_data_status["last_sent_count"]:
                 # No new files in last 2 seconds, stop loop
-                user_data_status["is_updating"] = False
                 break
-                
+
     except Exception as e:
         logger.error("Error in batch_status_loop: %s", e)
+    finally:
         user_data_status["is_updating"] = False
 
 async def update_batch_status(message, context: ContextTypes.DEFAULT_TYPE, collection_name: str):
@@ -901,7 +985,10 @@ async def show_collection_page(
         InlineKeyboardButton("🔄 צפייה בגלילה", callback_data=f"scroll_view:{collection_id}:0"),
         InlineKeyboardButton("ℹ️ מידע", callback_data=f"page_info:{collection_id}:{page}:0")
     ])
-    
+    keyboard_list.append([
+        InlineKeyboardButton("⭐ מועדפים", callback_data=f"fav_page:{collection_id}:1")
+    ])
+
     # Back button logic
     if is_admin(effective_user_id) and collection[2] != effective_user_id:
         # Admin viewing someone else's collection -> return to management of that collection

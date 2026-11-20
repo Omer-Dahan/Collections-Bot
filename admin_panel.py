@@ -1,12 +1,20 @@
 # admin_panel.py
 # ממשק ניהול מלא - פיצול מ-bot.py
 
+import asyncio
+import logging
+
+import constants
 import db
 from config import ADMIN_IDS, is_admin
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from datetime import datetime
 import html
+
+from utils import check_file_id as _check_file_id
+
+logger = logging.getLogger(__name__)
 
 
 def build_admin_main_menu():
@@ -54,19 +62,35 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """טיפול בכל ה-callbacks של admin"""
     query = update.callback_query
-    await query.answer()
-    
     user = query.from_user
-    
+
     if not is_admin(user.id):
+        await query.answer()
         await query.edit_message_text("⛔ אין לך הרשאות גישה.")
         return
-    
-    data = query.data
-    
+
+    # Sub-handlers may answer with their own alert, so the default empty answer
+    # comes last; a callback query can only be answered once.
+    try:
+        await _dispatch_admin_callback(query, context, query.data)
+    except (ValueError, IndexError):
+        # Malformed callback data (non-numeric id, missing part): ignore silently
+        pass
+    finally:
+        try:
+            await query.answer()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass  # Already answered by a sub-handler
+
+
+async def _dispatch_admin_callback(query, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """Route an admin callback to its handler. May raise ValueError/IndexError on bad data."""
     # Main menu callbacks
     if data == "admin_users":
-        await show_users_list(query, context)
+        await show_users_list(query, context, page=1)
+    elif data.startswith("admin_users_page:"):
+        page = int(data.split(":")[1])
+        await show_users_list(query, context, page=page)
     elif data == "admin_collections":
         await show_collections_list(query, context, page=1)
     elif data.startswith("admin_collections_page:"):
@@ -170,28 +194,38 @@ async def show_global_stats(query, context: ContextTypes.DEFAULT_TYPE):
 
 # === Users Functions ===
 
-async def show_users_list(query, context: ContextTypes.DEFAULT_TYPE):
-    """תצוגת רשימת משתמשים"""
-    user_ids = db.get_all_users_with_collections()
-    
-    if not user_ids:
+async def show_users_list(query, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    """תצוגת רשימת משתמשים עם pagination"""
+    items_per_page = 20
+    total_users = db.count_users_with_collections()
+
+    if total_users == 0:
         await query.edit_message_text(
             "אין משתמשים עם אוספים במערכת.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")]])
         )
         return
-    
-    message_text = "👥 <b>רשימת משתמשים</b>\n\nבחר משתמש לצפייה:"
+
+    total_pages = (total_users + items_per_page - 1) // items_per_page
+    page = max(1, min(page, total_pages))
+    users = db.get_users_with_collections_page(offset=(page - 1) * items_per_page, limit=items_per_page)
+
+    message_text = f"👥 <b>רשימת משתמשים</b> (עמוד {page}/{total_pages})\n\nבחר משתמש לצפייה:"
     keyboard = []
-    
-    for uid in user_ids:
-        user_info = db.get_user_details(uid)
-        if user_info:
-            username = user_info['username'] or ""
-            first_name = user_info['first_name'] or f"User_{uid}"
-            display_name = f"{first_name} (@{username})" if username else first_name
-            keyboard.append([InlineKeyboardButton(display_name, callback_data=f"admin_user_card:{uid}")])
-    
+
+    for uid, username, first_name in users:
+        name = first_name or f"User_{uid}"
+        display_name = f"{name} (@{username})" if username else name
+        keyboard.append([InlineKeyboardButton(display_name, callback_data=f"admin_user_card:{uid}")])
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️ הקודם", callback_data=f"admin_users_page:{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("הבא ▶️", callback_data=f"admin_users_page:{page+1}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+
     keyboard.append([InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")])
     
     await query.edit_message_text(
@@ -369,28 +403,26 @@ async def clone_collection_action(query, context: ContextTypes.DEFAULT_TYPE, col
 
 async def show_shares_dashboard(query, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
     """מסך ראשי שיתופים - תצוגת טקסט עם pagination"""
-    shares = db.get_all_active_shares()
-    
-    if not shares:
+    total_shares = db.count_active_shares()
+
+    if total_shares == 0:
         await query.edit_message_text(
-            "🔗 **שיתופים**\n\nאין קודי שיתוף פעילים במערכת.",
+            "🔗 <b>שיתופים</b>\n\nאין קודי שיתוף פעילים במערכת.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור", callback_data="admin_back_to_main")]]),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
-    
+
     # Pagination settings
     items_per_page = 20
-    total_shares = len(shares)
     total_pages = (total_shares + items_per_page - 1) // items_per_page
-    
+
     # Ensure page is in valid range
     page = max(1, min(page, total_pages))
-    
+
     start_idx = (page - 1) * items_per_page
-    end_idx = min(start_idx + items_per_page, total_shares)
-    page_shares = shares[start_idx:end_idx]
-    
+    page_shares = db.get_all_active_shares(offset=start_idx, limit=items_per_page)
+
     message_text = f"🔗 <b>שיתופים פעילים</b> (עמוד {page}/{total_pages})\n\n"
     
     for idx, (share_id, share_code, collection_id, collection_name, created_by, creator_username, created_at, unique_users, total_accesses) in enumerate(page_shares, start=start_idx + 1):
@@ -443,15 +475,8 @@ async def show_shares_dashboard(query, context: ContextTypes.DEFAULT_TYPE, page:
 
 async def show_share_card(query, context: ContextTypes.DEFAULT_TYPE, share_id: int):
     """כרטיס שיתוף בודד - עם כפתורי פעולה"""
-    # Get all shares to find the one we need
-    all_shares = db.get_all_active_shares()
-    share_info = None
-    
-    for share in all_shares:
-        if share[0] == share_id:
-            share_info = share
-            break
-    
+    share_info = db.get_active_share_by_id(share_id)
+
     if not share_info:
         await query.answer("שיתוף לא נמצא", show_alert=True)
         return
@@ -556,9 +581,9 @@ async def show_share_access_log(query, context: ContextTypes.DEFAULT_TYPE, share
     
     if not logs:
         await query.edit_message_text(
-            "📊 **לוג גישות**\n\nאין גישות רשומות.",
+            "📊 <b>לוג גישות</b>\n\nאין גישות רשומות.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור", callback_data=f"admin_shares")]]),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     
@@ -611,9 +636,9 @@ async def show_user_collections(query, context: ContextTypes.DEFAULT_TYPE, user_
     keyboard.append([InlineKeyboardButton("⬅️ חזור", callback_data=f"admin_user_card:{user_id}")])
     
     await query.edit_message_text(
-        f"📦 **אוספים של משתמש {user_id}:**",
+        f"📦 <b>אוספים של משתמש {user_id}:</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
@@ -682,8 +707,14 @@ async def delete_collection_action(query, context: ContextTypes.DEFAULT_TYPE, co
     db.delete_all_items_in_collection(collection_id)
     # Delete collection
     success = db.delete_collection(collection_id)
-    
+
     if success:
+        # Drop stale "active collection" pointers to the deleted collection
+        for uid in list(constants.active_collections):
+            if constants.active_collections.get(uid) == collection_id:
+                constants.active_collections.pop(uid, None)
+                constants.active_collection_timestamps.pop(uid, None)
+
         await query.edit_message_text(
             "✅ האוסף נמחק בהצלחה!",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור לתפריט ראשי", callback_data="admin_back_to_main")]])
@@ -726,14 +757,116 @@ async def show_scan_files_menu(query, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+_SCAN_DELAY = 0.05  # seconds between Telegram requests
+
+# Only one admin scan may run at a time (module-level reference to the running task)
+_scan_task = None
+
+
+def _scan_is_running() -> bool:
+    return _scan_task is not None and not _scan_task.done()
+
+
+def _format_eta(total: int) -> str:
+    """Rough ETA string (about 0.07s of network time per item on top of the delay)."""
+    est_seconds = int(total * (_SCAN_DELAY + 0.07))
+    if est_seconds < 60:
+        return f"~{est_seconds} שניות"
+    return f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות"
+
+
+async def _run_scan_loop(context, total: int, target_col_id, scope_label: str, edit):
+    """
+    Check stored file_ids and report progress through `edit(text, final=False)`.
+    Runs as a background task so the bot keeps handling other updates.
+    """
+    try:
+        invalid_count = 0
+        invalid_sample = []  # Keep only the rows shown in the final report.
+        type_breakdown: dict = {}
+        checked = 0
+        update_every = max(10, total // 20)  # update ~20 times total
+
+        offset = 0
+        page_size = 100
+        while checked < total:
+            page = db.get_file_items_page(offset, min(page_size, total - checked), target_col_id)
+            if not page:
+                break
+            for item_id, c_type, fid in page:
+                is_valid = await _check_file_id(context.bot, fid, c_type)
+                if not is_valid:
+                    invalid_count += 1
+                    type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
+                    if len(invalid_sample) < 20:
+                        invalid_sample.append((item_id, c_type))
+                checked += 1
+                await asyncio.sleep(_SCAN_DELAY)
+
+                if checked % update_every == 0 or checked == total:
+                    pct = int(checked / total * 100)
+                    await edit(
+                        f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
+                        f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
+                        f"❌ לא תקינים עד כה: {invalid_count}"
+                    )
+            offset += len(page)
+
+        valid_count = checked - invalid_count
+
+        breakdown_lines = "\n".join(
+            f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
+        ) or "  —"
+
+        report = (
+            f"📋 <b>דוח סריקת file_ids</b>\n"
+            f"היקף: {scope_label}\n\n"
+            f"📦 נסרקו: {checked:,}\n"
+            f"✅ תקינים: {valid_count:,}\n"
+            f"❌ לא תקינים: {invalid_count}\n\n"
+            f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
+        )
+
+        if invalid_sample:
+            sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct in invalid_sample)
+            report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
+            if invalid_count > 20:
+                report += f"\n  ... ועוד {invalid_count - 20} נוספים"
+
+        await edit(report, final=True)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Admin file scan failed")
+        await edit("❌ הסריקה נכשלה עקב שגיאה. פרטים בלוג.", final=True)
+
+
+def _make_scan_editor(edit_text):
+    """Wrap a message-edit coroutine so progress edits swallow errors and the final one is sent safely."""
+    async def edit(text: str, final: bool = False):
+        try:
+            await edit_text(text, final)
+        except Exception:  # pylint: disable=broad-exception-caught
+            if final:
+                # Most likely message too long: retry with a trimmed report
+                try:
+                    trimmed = text[:3800] + "\n\n⚠️ הדוח קוצר עקב מגבלת אורך הודעה."
+                    await edit_text(trimmed, final)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.warning("Failed to deliver admin scan report")
+            # Progress edits: ignore "message not modified" or flood-control errors
+    return edit
+
+
 async def run_scan_files_inline(query, context: ContextTypes.DEFAULT_TYPE):
     """
-    Run the file_id validity scan triggered from the admin inline menu.
-    Edits the same message to show live progress and a final report.
-    Unlike scan_file_ids (command-based), this works entirely through
-    callback_query.edit_message_text so it never needs update.message.
+    Start the file_id validity scan triggered from the admin inline menu.
+    The scan runs as a background task and edits the same message with live
+    progress and a final report.
     """
-    import asyncio as _asyncio
+    global _scan_task
+
+    if _scan_is_running():
+        await query.answer("⏳ כבר רצה סריקה. המתן לסיומה.", show_alert=True)
+        return
 
     await query.answer("⏳ מתחיל סריקה...")
 
@@ -748,88 +881,27 @@ async def run_scan_files_inline(query, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    DELAY = 0.05
-    est_seconds = int(total * (DELAY + 0.07))
-    eta_str = f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות" if est_seconds >= 60 else f"~{est_seconds} שניות"
-
     # Show initial progress message (no keyboard during scan — prevents double-click)
     try:
         await query.edit_message_text(
             f"🔍 <b>סריקת file_ids — כל המאגר</b>\n"
-            f"סורק {total:,} פריטים | {eta_str}\n"
+            f"סורק {total:,} פריטים | {_format_eta(total)}\n"
             f"0 / {total:,}",
             parse_mode="HTML"
         )
     except Exception:  # pylint: disable=broad-exception-caught
         pass
 
-    invalid_count = 0
-    invalid_sample = []  # Keep only the rows shown in the final report.
-    type_breakdown: dict = {}
-    checked = 0
-    UPDATE_EVERY = max(10, total // 20)  # update ~20 times total
+    back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ חזור לתפריט", callback_data="admin_back_to_main")]])
 
-    offset = 0
-    page_size = 100
-    while checked < total:
-        page = db.get_file_items_page(offset, min(page_size, total - checked))
-        if not page:
-            break
-        for item_id, c_type, fid in page:
-            is_valid = await _check_file_id(context.bot, fid, c_type)
-            if not is_valid:
-                invalid_count += 1
-                type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
-                if len(invalid_sample) < 20:
-                    invalid_sample.append((item_id, c_type))
-            checked += 1
-            await _asyncio.sleep(DELAY)
+    async def edit_text(text: str, final: bool):
+        await query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=back_markup if final else None
+        )
 
-            if checked % UPDATE_EVERY == 0 or checked == total:
-                pct = int(checked / total * 100)
-                try:
-                    await query.edit_message_text(
-                        f"🔍 <b>סריקת file_ids — כל המאגר</b>\n"
-                        f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
-                        f"❌ לא תקינים עד כה: {invalid_count}",
-                        parse_mode="HTML"
-                    )
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass  # Ignore "message not modified" or flood-control errors
-        offset += len(page)
-
-    # Build final report
-    valid_count = total - invalid_count
-
-    breakdown_lines = "\n".join(
-        f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
-    ) or "  —"
-
-    report = (
-        f"📋 <b>דוח סריקת file_ids</b>\n"
-        f"היקף: כל המאגר\n\n"
-        f"📦 נסרקו: {total:,}\n"
-        f"✅ תקינים: {valid_count:,}\n"
-        f"❌ לא תקינים: {invalid_count}\n\n"
-        f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
+    _scan_task = context.application.create_task(
+        _run_scan_loop(context, total, None, "כל המאגר", _make_scan_editor(edit_text))
     )
-
-    if invalid_sample:
-        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct in invalid_sample)
-        report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
-        if invalid_count > 20:
-            report += f"\n  ... ועוד {invalid_count - 20} נוספים"
-
-    keyboard = [[InlineKeyboardButton("⬅️ חזור לתפריט", callback_data="admin_back_to_main")]]
-    try:
-        await query.edit_message_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception:  # pylint: disable=broad-exception-caught
-        # If message is too long, send a trimmed version
-        trimmed = report[:3800] + "\n\n⚠️ הדוח קוצר עקב מגבלת אורך הודעה."
-        await query.edit_message_text(trimmed, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-from utils import check_file_id as _check_file_id
-
 
 
 async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
@@ -842,11 +914,15 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
         /scanfiles <col_id> <limit>  → scan at most <limit> items from that collection
         /scanfiles all <limit>       → scan at most <limit> items from the whole DB
     """
-    import asyncio as _asyncio
+    global _scan_task
 
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("⛔ אין לך הרשאות.")
+        return
+
+    if _scan_is_running():
+        await update.message.reply_text("⏳ כבר רצה סריקה. המתן לסיומה.")
         return
 
     # ── Parse arguments ──────────────────────────────────────────────
@@ -881,7 +957,7 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
         if not col:
             await update.message.reply_text(f"❌ אוסף {target_col_id} לא נמצא.")
             return
-        scope_label = f"אוסף #{target_col_id} ({col[1]})"
+        scope_label = f"אוסף #{target_col_id} ({html.escape(col[1])})"
     else:
         scope_label = "כל המאגר"
 
@@ -894,13 +970,7 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("אין פריטים עם file_id לסריקה.")
         return
 
-    # ── ETA estimate (0.07s per item including network round-trip) ────
-    DELAY = 0.05  # seconds between requests
-    est_seconds = int(total * (DELAY + 0.07))
-    if est_seconds < 60:
-        eta_str = f"~{est_seconds} שניות"
-    else:
-        eta_str = f"~{est_seconds // 60} דקות ו-{est_seconds % 60} שניות"
+    eta_str = _format_eta(total)
 
     # Warn if no limit was given and collection is large
     if item_limit is None and total > 500:
@@ -921,63 +991,9 @@ async def scan_file_ids(update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    # ── Scan loop ─────────────────────────────────────────────────────
-    invalid_count = 0
-    invalid_sample = []  # Keep only what the final report displays.
-    type_breakdown: dict = {}
-    checked = 0
-    UPDATE_EVERY = max(10, total // 20)  # update ~20 times during scan
+    async def edit_text(text: str, final: bool):
+        await status_msg.edit_text(text, parse_mode="HTML")
 
-    offset = 0
-    page_size = 100
-    while checked < total:
-        page = db.get_file_items_page(offset, min(page_size, total - checked), target_col_id)
-        if not page:
-            break
-        for item_id, c_type, fid in page:
-            is_valid = await _check_file_id(context.bot, fid, c_type)
-            if not is_valid:
-                invalid_count += 1
-                type_breakdown[c_type] = type_breakdown.get(c_type, 0) + 1
-                if len(invalid_sample) < 20:
-                    invalid_sample.append((item_id, c_type))
-            checked += 1
-            await _asyncio.sleep(DELAY)
-
-            if checked % UPDATE_EVERY == 0 or checked == total:
-                pct = int(checked / total * 100)
-                try:
-                    await status_msg.edit_text(
-                        f"🔍 <b>סריקת file_ids</b> — {scope_label}\n"
-                        f"✅ נבדקו: {checked:,} / {total:,} ({pct}%)\n"
-                        f"❌ לא תקינים עד כה: {invalid_count}",
-                        parse_mode="HTML"
-                    )
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass
-        offset += len(page)
-
-    # ── Build final report ────────────────────────────────────────────
-    valid_count = total - invalid_count
-
-    breakdown_lines = "\n".join(
-        f"  • {ct}: {cnt}" for ct, cnt in sorted(type_breakdown.items())
-    ) or "  —"
-
-    report = (
-        f"📋 <b>דוח סריקת file_ids</b>\n"
-        f"היקף: {scope_label}\n\n"
-        f"📦 נסרקו: {total:,}\n"
-        f"✅ תקינים: {valid_count:,}\n"
-        f"❌ לא תקינים: {invalid_count}\n\n"
-        f"<b>לא תקינים לפי סוג:</b>\n{breakdown_lines}"
+    _scan_task = context.application.create_task(
+        _run_scan_loop(context, total, target_col_id, scope_label, _make_scan_editor(edit_text))
     )
-
-    if invalid_sample:
-        sample_lines = "\n".join(f"  ID {iid} ({ct})" for iid, ct in invalid_sample)
-        report += f"\n\n<b>מזהי פריטים לא תקינים (עד 20):</b>\n{sample_lines}"
-        if invalid_count > 20:
-            report += f"\n  ... ועוד {invalid_count - 20} נוספים"
-
-    await status_msg.edit_text(report, parse_mode="HTML")
-

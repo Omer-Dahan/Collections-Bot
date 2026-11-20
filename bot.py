@@ -17,6 +17,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
     filters,
     AIORateLimiter,
     ContextTypes,
@@ -24,7 +26,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 import db
-from config import BOT_TOKEN
+from config import BOT_TOKEN, is_admin
 from admin_panel import admin_panel, handle_admin_callback, scan_file_ids
 from utils import error_handler, UserActionFilter, logger, touch_user_activity
 from constants import (
@@ -56,11 +58,15 @@ from handlers import (
     handle_collection_info_callback,
     start_invalid_scan_callback, handle_invalid_scan_control_callback,
     handle_invalid_scan_delete_callback, cleanup_invalid_scans,
+    handle_fav_page_callback, handle_fav_group_callback,
+    handle_fav_scroll_callback, handle_fav_random_callback,
+    handle_fav_toggle_callback,
     handle_message
 )
 
 # הגדרת הקובץ
-_LOCKFILE = os.path.join(os.path.dirname(__file__), ".bot.pid")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCKFILE = os.path.join(_BASE_DIR, ".bot.pid")
 
 def _kill_old_instance():
     """Kill any previous bot instance that's still running."""
@@ -72,8 +78,8 @@ def _kill_old_instance():
             return
         old_proc = psutil.Process(old_pid)
         # Verify it's actually our bot (not some other process reusing the PID)
-        cmdline = " ".join(old_proc.cmdline())
-        if "bot.py" in cmdline:
+        is_our_bot = any(os.path.basename(arg) == "bot.py" for arg in old_proc.cmdline())
+        if is_our_bot:
             logging.warning("⚠️ Killing old bot instance (PID %d) to prevent database lock", old_pid)
             # Kill children first (sub-processes)
             for child in old_proc.children(recursive=True):
@@ -90,7 +96,7 @@ def setup_logging():
     """Configure bot logging with file and console handlers."""
     # File handler - only user actions and errors
     file_handler = RotatingFileHandler(
-        "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        os.path.join(_BASE_DIR, "bot.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
     file_handler.setLevel(logging.INFO)
     format_str = "%(asctime)s [%(levelname)s]: %(message)s"
@@ -153,6 +159,26 @@ async def check_expired_shares_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.error("Error processing expired share %s: %s", share_code, e)
     except Exception as e: # pylint: disable=broad-exception-caught
         logger.error("Error in check_expired_shares_job: %s", e)
+
+async def block_guard(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler and silently drops updates from blocked users."""
+    user = update.effective_user
+    if not user or is_admin(user.id):
+        return
+    try:
+        blocked = db.is_user_blocked(user.id)
+    except Exception: # pylint: disable=broad-exception-caught
+        logger.exception("Block check failed for user %s", user.id)
+        return
+    if not blocked:
+        return
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except Exception: # pylint: disable=broad-exception-caught
+            pass
+    raise ApplicationHandlerStop
+
 
 async def track_user_messages(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Global handler to track ALL user messages during shared sessions."""
@@ -329,6 +355,11 @@ def _register_handlers(app):
     app.add_handler(CallbackQueryHandler(
         handle_invalid_scan_delete_callback, pattern="^scan_invalid_delete:"
     ))
+    app.add_handler(CallbackQueryHandler(handle_fav_page_callback, pattern="^fav_page:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_group_callback, pattern="^fav_group:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_scroll_callback, pattern="^fav_scroll:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_random_callback, pattern="^fav_random:"))
+    app.add_handler(CallbackQueryHandler(handle_fav_toggle_callback, pattern="^fav_toggle:"))
     app.add_handler(CallbackQueryHandler(
         handle_invalid_scan_control_callback,
         pattern="^scan_invalid_(pause|resume|cancel):"
@@ -338,9 +369,10 @@ def _register_handlers(app):
     ))
 
     # Messages
-    app.add_handler(MessageHandler(filters.ALL, track_user_messages), group=-1)
+    app.add_handler(TypeHandler(Update, block_guard), group=-3)
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, track_user_messages), group=-1)
     app.add_handler(CallbackQueryHandler(track_callback_activity), group=-2)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_message))
 
 def main():
     """Start the bot application."""
@@ -377,7 +409,17 @@ def main():
         logger.info("Share expiration cleanup job scheduled")
 
     logger.info("Polling...")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        # Remove our PID file on exit, but never one that belongs to a newer instance
+        try:
+            with open(_LOCKFILE, encoding="utf-8") as f:
+                owns_lock = f.read().strip() == str(os.getpid())
+            if owns_lock:
+                os.remove(_LOCKFILE)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     main()

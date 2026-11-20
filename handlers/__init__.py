@@ -39,6 +39,11 @@ from .browse_handlers import (
     handle_batch_status_callback, handle_random_video_scroll_callback,
     handle_search_collection_callback
 )
+from .favorites import (
+    handle_fav_page_callback, handle_fav_group_callback,
+    handle_fav_scroll_callback, handle_fav_random_callback,
+    handle_fav_toggle_callback
+)
 from .messages import (
     handle_message, handle_new_collection_name_input,
     handle_import_col_callback
@@ -72,6 +77,9 @@ __all__ = [
     "handle_dupes_page_callback",
     "start_invalid_scan_callback", "handle_invalid_scan_control_callback",
     "handle_invalid_scan_delete_callback", "cleanup_invalid_scans",
+    "handle_fav_page_callback", "handle_fav_group_callback",
+    "handle_fav_scroll_callback", "handle_fav_random_callback",
+    "handle_fav_toggle_callback",
 
     # Messages
     "handle_message", "handle_new_collection_name_input"

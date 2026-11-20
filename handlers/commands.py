@@ -52,10 +52,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     channel_id=chat.id,
                     file_id=None,
                     content_type="text",
-                    caption=f"📝 *תוכן פריט {item_id}:*\n\n{text_content}"
+                    caption=f"📝 תוכן פריט {item_id}:\n\n{text_content}"
                 )
             else:
-                caption = f"📦 *פריט {item_id}*"
+                caption = f"📦 פריט {item_id}"
                 if text_content:
                     caption += f"\n\n{text_content}"
                     
@@ -83,7 +83,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ שגיאה בטעינת הקובץ.")
             return
 
-    logger.info("Saved item from user_id=%s username=%s", user.id, user.username)
+    logger.info("User started bot user_id=%s username=%s", user.id, user.username)
 
     # Update the reply keyboard to show only /start
     # We do this with a temporary message that gets deleted
@@ -123,6 +123,10 @@ async def new_collection_flow(message, user, context, args: list[str], edit_mess
         return
 
     name = " ".join(args)
+    if len(name) > 64:
+        await message.reply_text("❌ שם האוסף ארוך מדי (עד 64 תווים).")
+        return
+
     try:
         collection_id = db.create_collection(name, user.id)
         set_active_collection(user.id, collection_id)
@@ -137,7 +141,7 @@ async def new_collection_flow(message, user, context, args: list[str], edit_mess
         if "UNIQUE constraint failed" in str(e):
             await message.reply_text(f"❌ כבר יש לך אוסף בשם '{name}'.\nבחר שם אחר.")
         else:
-            await message.reply_text(f"שגיאה ביצירת אוסף: {e}")
+            await message.reply_text("❌ אירעה שגיאה ביצירת האוסף. נסה שוב מאוחר יותר.")
 
 @record_activity
 async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,15 +177,9 @@ async def show_browse_menu(chat_id: int, user_id: int, context: ContextTypes.DEF
     """
     collections = db.get_collections(user_id)
     if not collections:
-        text = "אין אוספים לדפדוף."
-        if edit_message_id:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=text
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text)
+        await send_response(
+            context.bot, chat_id, "אין אוספים לדפדוף.", None, edit_message_id
+        )
         return
 
     # Browse needs special callback format with page number, so build manually

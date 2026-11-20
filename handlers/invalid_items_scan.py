@@ -11,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 import db
-from utils import parse_callback_data, parse_and_validate_access, check_file_id
+from utils import parse_callback_data, parse_and_validate_owner, check_file_id
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +84,10 @@ def _get_scan_keyboard(col_id: int, status: str) -> InlineKeyboardMarkup:
 async def start_invalid_scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the invalid items scan for a collection."""
     query = update.callback_query
-    await query.answer()
 
     parts = parse_callback_data(query.data, "scan_invalid")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
+    await query.answer()
     if not is_allowed:
         return
 
@@ -137,11 +137,12 @@ async def start_invalid_scan_callback(update: Update, context: ContextTypes.DEFA
         "chat_id": chat_id,
         "message_id": message_id,
         "last_update_text": "",
+        "paused_at": None,
         "updated_at": time.time()
     }
     context.bot_data["invalid_scans"][col_id] = state
 
-    task = asyncio.create_task(_scan_worker(col_id, context))
+    task = context.application.create_task(_scan_worker(col_id, context))
     state["task"] = task
 
     def _on_task_done(t: asyncio.Task):
@@ -149,6 +150,16 @@ async def start_invalid_scan_callback(update: Update, context: ContextTypes.DEFA
             logger.error(f"Scan worker task failed for col_id={col_id}: {t.exception()}")
 
     task.add_done_callback(_on_task_done)
+
+
+async def _wait_while_paused(state: dict):
+    """Block while the scan is paused; auto-cancel if paused longer than SCAN_STATE_TTL."""
+    while state["status"] == "paused":
+        paused_at = state.get("paused_at") or time.time()
+        if time.time() - paused_at > SCAN_STATE_TTL:
+            state["status"] = "cancelling"
+            break
+        await asyncio.sleep(1)
 
 
 async def _scan_worker(col_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -169,10 +180,7 @@ async def _scan_worker(col_id: int, context: ContextTypes.DEFAULT_TYPE):
             if state["status"] == "cancelling":
                 break
 
-            while state["status"] == "paused":
-                await asyncio.sleep(1)
-                if state["status"] == "cancelling":
-                    break
+            await _wait_while_paused(state)
 
             if state["status"] == "cancelling":
                 break
@@ -185,10 +193,9 @@ async def _scan_worker(col_id: int, context: ContextTypes.DEFAULT_TYPE):
                 if state["status"] == "cancelling":
                     break
 
-                while state["status"] == "paused":
-                    await asyncio.sleep(1)
-                    if state["status"] == "cancelling":
-                        break
+                await _wait_while_paused(state)
+                if state["status"] == "cancelling":
+                    break
 
                 is_valid = await check_file_id(context.bot, fid, c_type)
                 if not is_valid:
@@ -226,6 +233,16 @@ async def _scan_worker(col_id: int, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in scan worker for col_id={col_id}: {e}", exc_info=True)
         state["status"] = "error"
+        await _safe_edit_message(
+            context,
+            chat_id,
+            message_id,
+            f"❌ <b>הסריקה נכשלה</b> — {safe_col_name}\n\n"
+            f"נבדקו {state['checked']:,} מתוך {total:,} פריטים לפני שהתרחשה שגיאה.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזור לאוסף", callback_data=f"manage_collection:{col_id}")]]),
+            parse_mode="HTML"
+        )
+        state["task"] = None
 
     state["updated_at"] = time.time()
 
@@ -285,15 +302,13 @@ async def handle_invalid_scan_control_callback(update: Update, context: ContextT
     """Handle pause, resume, cancel for invalid scan with proper access check and error handling."""
     query = update.callback_query
 
-    try:
-        parts = parse_callback_data(query.data, "scan_invalid")
-        action, col_id_str = query.data.split(":")
-        col_id = int(col_id_str)
-    except Exception:
+    parts = parse_callback_data(query.data, "scan_invalid")
+    if not parts or len(parts) < 2:
         await query.answer("❌ בקשה לא תקינה.", show_alert=True)
         return
+    action = parts[0]
 
-    is_allowed, col = await parse_and_validate_access(update, context, [str(col_id)], index=0)
+    is_allowed, col_id, _ = await parse_and_validate_owner(update, context, parts, index=1)
     if not is_allowed:
         await query.answer("⛔ אין לך הרשאה לפעולה זו.", show_alert=True)
         return
@@ -310,6 +325,7 @@ async def handle_invalid_scan_control_callback(update: Update, context: ContextT
     if action == "scan_invalid_pause":
         if state["status"] == "running":
             state["status"] = "paused"
+            state["paused_at"] = time.time()
             state["updated_at"] = time.time()
             await query.answer("הסריקה הושהתה.")
 
@@ -337,6 +353,7 @@ async def handle_invalid_scan_control_callback(update: Update, context: ContextT
     elif action == "scan_invalid_resume":
         if state["status"] == "paused":
             state["status"] = "running"
+            state["paused_at"] = None
             state["updated_at"] = time.time()
             await query.answer("הסריקה ממשיכה.")
 
@@ -377,8 +394,9 @@ async def handle_invalid_scan_delete_callback(update: Update, context: ContextTy
     query = update.callback_query
 
     parts = parse_callback_data(query.data, "scan_invalid_delete")
-    is_allowed, col_id, col = await parse_and_validate_access(update, context, parts)
+    is_allowed, col_id, col = await parse_and_validate_owner(update, context, parts)
     if not is_allowed:
+        await query.answer()
         return
 
     state = context.bot_data.get("invalid_scans", {}).get(col_id)
@@ -392,7 +410,7 @@ async def handle_invalid_scan_delete_callback(update: Update, context: ContextTy
         return
 
     await query.answer("⏳ מוחק פריטים פגומים...")
-    deleted_count = db.delete_items_by_ids(invalid_ids)
+    deleted_count = db.delete_items_by_ids(invalid_ids, collection_id=col_id)
 
     # Cleanup state after deletion
     context.bot_data.get("invalid_scans", {}).pop(col_id, None)

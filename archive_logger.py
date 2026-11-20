@@ -15,13 +15,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Literal
 from telegram import Bot, InlineKeyboardMarkup
-from telegram.error import TelegramError, Forbidden, RetryAfter
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
-# Channel IDs - configured by admin
-ADMIN_ACTIVITY_CHANNEL = -1003542497376  # ערוץ מידע - בוט אוספים
+import config
 
-# Feature toggle
-ENABLE_ARCHIVING = True
+# Activity channel and feature toggle come from the environment (see config.py).
+# Archiving is active only when it is enabled AND a channel is configured.
+ADMIN_ACTIVITY_CHANNEL = config.LOG_CHANNEL_ID
+ENABLE_ARCHIVING = config.ENABLE_ARCHIVING and config.LOG_CHANNEL_ID != 0
 
 # Rate limiting - delays for activity logging
 ACTIVITY_LOG_DELAY = 1.0  # seconds between activity logs (helps avoid 429 bursts)
@@ -135,16 +136,18 @@ async def _send_with_retry(
             wait_time = e.retry_after + RETRY_EXTRA_DELAY
             logger.warning(f"Rate limited (attempt {attempt+1}), waiting {wait_time}s")
             await asyncio.sleep(wait_time)
-        except Forbidden:
-            logger.error("Bot not authorized in channel")
-            return None
-        except (TelegramError, Exception) as e:
-            logger.warning(f"Send error (attempt {attempt+1}): {e}")
+        except (NetworkError, TimedOut) as e:
+            # Transient network problem - worth retrying
+            logger.warning(f"Network error (attempt {attempt+1}): {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(RETRY_EXTRA_DELAY)
             else:
                 logger.error(f"Failed to send after {max_retries} attempts: {e}")
                 return None
+        except Exception as e:
+            # BadRequest, Forbidden and other errors will not fix themselves
+            logger.error(f"Send failed, not retrying: {e}")
+            return None
     return None
 
 
@@ -315,21 +318,25 @@ async def archive_file_to_channels(
     
     # Enqueue before starting the worker, while holding the lock, so a worker
     # can never observe an empty queue and exit between these two operations.
-    # ``put`` deliberately applies backpressure when the queue is full.
+    # Never block the caller: when the queue is full the log entry is dropped.
     async with _archive_lock:
-        await _archive_queue.put({
-            "item_id": item_id,
-            "file_id": file_id,
-            "content_type": content_type,
-            "user_id": user_id,
-            "collection_id": collection_id,
-            "collection_name": collection_name,
-            "file_name": file_name,
-            "original_caption": original_caption,
-            "user_name": user_name,
-            "username": username,
-            "bot": bot  # Store bot reference for queue processor
-        })
+        try:
+            _archive_queue.put_nowait({
+                "item_id": item_id,
+                "file_id": file_id,
+                "content_type": content_type,
+                "user_id": user_id,
+                "collection_id": collection_id,
+                "collection_name": collection_name,
+                "file_name": file_name,
+                "original_caption": original_caption,
+                "user_name": user_name,
+                "username": username,
+                "bot": bot  # Store bot reference for queue processor
+            })
+        except asyncio.QueueFull:
+            logger.warning("Archive queue full, dropping activity log for item %s", item_id)
+            return False
         
         # Start one worker only.  It stays alive while the application runs,
         # which also avoids creating a new task for every uploaded file.

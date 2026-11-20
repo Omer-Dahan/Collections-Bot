@@ -39,12 +39,15 @@ ARCHIVE_CHANNELS: list[int] = [
 ]
 
 # Admin Logging Channel (For events like share access, errors)
-LOG_CHANNEL_ID: int = int(get_env("LOG_CHANNEL_ID", default="0"))
+try:
+    LOG_CHANNEL_ID: int = int((get_env("LOG_CHANNEL_ID", default="0") or "0").strip())
+except ValueError:
+    LOG_CHANNEL_ID = 0
 
 # ============================================================
 # Feature Flags & Limits (non-sensitive, defaults allowed)
 # ============================================================
-ENABLE_ARCHIVING: bool = get_env("ENABLE_ARCHIVING", default="False").lower() == "true"
+ENABLE_ARCHIVING: bool = (get_env("ENABLE_ARCHIVING", default="False") or "").strip().lower() == "true"
 
 def is_admin(user_id: int) -> bool:
     """Check if a user is an admin."""
